@@ -1,8 +1,17 @@
 # WhalePet 鲸鱼娘
 
-一只住在 macOS 桌面上的女仆装鲸鱼娘：无边框透明悬浮窗，可以满屏拖动，能打字聊天，也能语音对话。
+一只住在桌面上的女仆装鲸鱼娘：无边框透明悬浮窗，可以满屏拖动，能打字聊天，也能语音对话。支持 **macOS**（原生 Swift）和 **Windows**（Electron 版）。
 
 动画素材来自 npm 包 [dsh-pet](https://www.npmjs.com/package/dsh-pet)（MIT 许可，作者 PC2005-cloud），构建时自动下载并提取，仓库本身不包含素材文件。
+
+## 下载（一键安装）
+
+到 [Releases](https://github.com/adfdsfvb3/whale-pet/releases) 下载：
+
+- **macOS**：`WhalePet-macOS.zip` → 解压双击（未签名，首次 右键 → 打开）
+- **Windows**：`WhalePet-Setup-1.0.0.exe` → NSIS 一键安装（未签名，SmartScreen 点"仍要运行"）
+
+安装后：右键宠物 → 设置，粘贴自己的 DeepSeek API key 即可聊天；agent 模式还需要本机装有 Node.js 和 deepseek-harness 仓库（设置里改路径），没有也能用纯聊天模式。
 
 ## 功能
 
@@ -33,14 +42,27 @@
 
 ## 构建
 
+### macOS 原生版
+
 依赖：macOS、Xcode Command Line Tools（`swiftc`）、python3、npm。
 
 ```sh
-./build.sh
-open dist/WhalePet.app
+./build.sh       # 构建 dist/WhalePet.app
+./release.sh     # 额外打出 dist/WhalePet-macOS.zip 发布包
 ```
 
-构建脚本会自动完成：npm 下载 dsh-pet 素材 → 创建 Python 虚拟环境（av/pillow/numpy）→ 从 webm 提取透明 PNG 帧（240px / 12fps）→ 生成应用图标 → `swiftc` 编译 → 打包 `dist/WhalePet.app`。
+构建脚本会自动完成：npm 下载 dsh-pet 素材 → 创建 Python 虚拟环境（av/pillow/numpy）→ 从 webm 提取透明 PNG 帧（240px / 12fps）→ 生成应用图标 → `swiftc` 编译 → 打包。
+
+### Windows 版（Electron）
+
+```sh
+cd electron
+npm install        # 慢的话用 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+npm start          # 本地调试
+npm run dist:win   # 打出 NSIS 安装包到 dist-electron/
+```
+
+功能与 macOS 版对齐（宠物动画/拖动/聊天/ACP agent/设置），差异：语音输入在 Electron 的 Chromium 里通常不可用（按钮自动禁用），语音朗读依赖系统中文语音包。
 
 ## 配置 API key（必需）
 
@@ -68,10 +90,12 @@ chmod 600 ~/.whalepet.conf
 ## 项目结构
 
 ```
-pet.swift          应用全部源码（AppKit，单文件）：宠物动画 + 对话气泡 + ACP 客户端 + 语音
+pet.swift          macOS 原生版全部源码（AppKit，单文件）
+electron/          Windows 跨平台版（Electron：main.js 主进程 + renderer/ 渲染层）
 extract_frames.py  帧提取脚本：webm → 抠黑底透明 PNG 序列
 test-acp.py        ACP 链路独立冒烟测试（python3 test-acp.py）
-build.sh           一键构建脚本
+build.sh           macOS 一键构建脚本
+release.sh         macOS 发布打包脚本（构建 + zip）
 Info.plist         app 包配置（含权限说明文案）
 ```
 
