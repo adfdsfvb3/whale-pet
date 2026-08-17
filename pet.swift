@@ -12,7 +12,6 @@ import Speech
 
 let fps: TimeInterval = 1.0 / 12.0
 let petSize: CGFloat = 220
-let bubbleSize = NSSize(width: 340, height: 300)
 let loopActions = ["idle", "drag"]
 let clickActions = ["happy", "shy", "angry"]
 let ambientActions = ["look", "hum", "stretch", "cube", "crab"]
@@ -24,6 +23,7 @@ let systemPrompt = "你是「鲸鱼娘」，一只穿女仆装的深海鲸鱼少
 let acpPersonaPrefix = "（对话设定：你是住在用户 Mac 桌面上的女仆装鲸鱼娘桌面宠物，说话软萌、用中文；工具结果照实汇报，但日常对话保持简短可爱。以下开始是用户的话。）"
 
 let dshRepo = "/Users/miao/deepseek-harness"
+let defaultDshRepo = dshRepo
 let nodeBin = "/Users/miao/.nvm/versions/node/v24.16.0/bin"
 
 struct ChatMessage: Codable {
@@ -40,6 +40,78 @@ struct ChatRequest: Encodable {
 struct ChatResponse: Decodable {
     struct Choice: Decodable { let message: ChatMessage }
     let choices: [Choice]
+}
+
+// MARK: - Minimal markdown rendering for chat replies
+
+/// Render a small markdown subset (fenced code blocks, # headings, **bold**,
+/// `inline code`, - lists pass through) into an attributed string.
+func renderMarkdown(_ text: String) -> NSAttributedString {
+    let base = NSFont.systemFont(ofSize: 12)
+    let bold = NSFont.boldSystemFont(ofSize: 12)
+    let code = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    let result = NSMutableAttributedString()
+    var inCodeBlock = false
+    for line in text.components(separatedBy: "\n") {
+        if line.hasPrefix("```") {
+            inCodeBlock.toggle()
+            continue
+        }
+        if inCodeBlock {
+            result.append(NSAttributedString(string: line + "\n", attributes: [
+                .font: code, .backgroundColor: NSColor.quaternaryLabelColor,
+            ]))
+            continue
+        }
+        var font = base
+        var content = line
+        if content.hasPrefix("#") {
+            content = content.replacingOccurrences(of: "^#+\\s*", with: "", options: .regularExpression)
+            font = bold
+        }
+        result.append(inlineMarkdown(content, base: font, bold: bold, code: code))
+        result.append(NSAttributedString(string: "\n", attributes: [.font: base]))
+    }
+    return result
+}
+
+private func inlineMarkdown(_ line: String, base: NSFont, bold: NSFont, code: NSFont) -> NSAttributedString {
+    let out = NSMutableAttributedString()
+    var rest = Substring(line)
+    func plain(_ s: Substring) {
+        if !s.isEmpty { out.append(NSAttributedString(string: String(s), attributes: [.font: base])) }
+    }
+    while !rest.isEmpty {
+        let boldRange = rest.range(of: "**")
+        let codeRange = rest.range(of: "`")
+        if let c = codeRange, boldRange == nil || c.lowerBound < boldRange!.lowerBound {
+            plain(rest[..<c.lowerBound])
+            let after = rest[c.upperBound...]
+            if let end = after.range(of: "`") {
+                out.append(NSAttributedString(string: String(after[..<end.lowerBound]), attributes: [
+                    .font: code, .backgroundColor: NSColor.quaternaryLabelColor,
+                ]))
+                rest = after[end.upperBound...]
+            } else {
+                plain("`" + after)
+                rest = ""
+            }
+        } else if let b = boldRange {
+            plain(rest[..<b.lowerBound])
+            let after = rest[b.upperBound...]
+            if let end = after.range(of: "**") {
+                out.append(NSAttributedString(string: String(after[..<end.lowerBound]), attributes: [.font: bold]))
+                rest = after[end.upperBound...]
+            } else {
+                plain("**" + after)
+                rest = ""
+            }
+        } else {
+            plain(rest)
+            rest = ""
+        }
+    }
+    return out
 }
 
 /// Models routed through the local dsh ACP agent; anything else goes direct API.
@@ -97,7 +169,7 @@ func loadConf() -> [String: String] {
 
 /// Write ~/.whalepet.conf with owner-only permissions. Keeps only known keys.
 func saveConf(_ conf: [String: String]) {
-    let order = ["DEEPSEEK_API_KEY", "WHALEPET_MODEL", "WHALEPET_TTS", "WHALEPET_TTS_RATE", "WHALEPET_SIZE", "WHALEPET_AMBIENT"]
+    let order = ["DEEPSEEK_API_KEY", "WHALEPET_MODEL", "WHALEPET_TTS", "WHALEPET_TTS_RATE", "WHALEPET_SIZE", "WHALEPET_AMBIENT", "WHALEPET_POS", "WHALEPET_DSH_REPO", "WHALEPET_HANDSFREE"]
     let lines = order.compactMap { key -> String? in
         guard let value = conf[key], !value.isEmpty else { return nil }
         return "\(key)=\(value)"
@@ -186,6 +258,11 @@ final class AcpClient {
 
     func respond(_ id: Int, result: [String: Any]) {
         write(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    /// Send a notification (no id, no response expected), e.g. session/cancel.
+    func notify(_ method: String, _ params: [String: Any]) {
+        write(["jsonrpc": "2.0", "method": method, "params": params])
     }
 
     func terminate() {
@@ -311,7 +388,7 @@ final class BubblePanel: NSPanel {
 
 // MARK: - Controller
 
-final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate, AVSpeechSynthesizerDelegate {
     private var window: NSPanel!
     private var view: PetView!
     private var bubble: BubblePanel!
@@ -328,6 +405,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
 
     // Direct-API fallback state
     private var history: [ChatMessage] = []
+    private var directTask: URLSessionDataTask?
 
     // ACP state
     private var acp: AcpClient?
@@ -348,11 +426,33 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     private var sizePopup: NSPopUpButton?
     private var ambientPopup: NSPopUpButton?
     private var loginCheckbox: NSButton?
+    private var repoField: NSTextField?
+    private var handsFreeCheckbox: NSButton?
     private var preferredModel: String = defaultModel
     private var currentPetSize: CGFloat = petSize
     private var ambientIndex = 2  // 正常
+    private var repoPath = dshRepo
+    private var acpIntentionalStop = false
+    private var handsFreeEnabled = false
+    private var handsFreeActive = false
     private var wantsAcp: Bool { acpModels.contains(preferredModel) }
     private var launchAgentPath: String { NSHomeDirectory() + "/Library/LaunchAgents/local.whalepet.plist" }
+
+    // Chat UX
+    private var sendButton: NSButton?
+    private var promptInFlight = false
+    private var acpRestarts = 0
+    private var replyStartLocation = 0
+    private var bubbleEnlarged = false
+    private let bubbleSmall = NSSize(width: 340, height: 380)
+    private let bubbleLarge = NSSize(width: 560, height: 600)
+
+    // Wandering
+    private var walkTimer: Timer?
+    private var walkTarget = NSPoint.zero
+    private var walkStep = NSPoint.zero
+    private var walkStepsLeft = 0
+    private var dragging = false
 
     // Plugins
     private var pluginsPanel: BubblePanel?
@@ -409,8 +509,17 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         view.imageScaling = .scaleProportionallyUpOrDown
         window.contentView = view
 
-        view.onDragStateChange = { [weak self] dragging in
-            self?.play(dragging ? "drag" : "idle")
+        view.onDragStateChange = { [weak self] isDragging in
+            guard let self else { return }
+            if isDragging {
+                self.dragging = true
+                self.endWalk(save: false)
+                self.play("drag")
+            } else {
+                if self.dragging { self.savePosition() }
+                self.dragging = false
+                self.play("idle")
+            }
         }
         view.onClick = { [weak self] in self?.toggleBubble() }
         view.onDoubleClick = { [weak self] in self?.play(clickActions.randomElement()!) }
@@ -421,6 +530,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
 
         let conf = loadConf()
         preferredModel = conf["WHALEPET_MODEL"] ?? defaultModel
+        repoPath = conf["WHALEPET_DSH_REPO"] ?? defaultDshRepo
+        handsFreeEnabled = conf["WHALEPET_HANDSFREE"] == "1"
         speechEnabled = conf["WHALEPET_TTS"] != "0"
         synthesizerRate = Double(conf["WHALEPET_TTS_RATE"] ?? "").map { Float($0) } ?? 0.52
         if let size = Double(conf["WHALEPET_SIZE"] ?? ""), petSizeOptions.contains(where: { $0.size == CGFloat(size) }) {
@@ -431,11 +542,23 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         if let ambient = Int(conf["WHALEPET_AMBIENT"] ?? ""), ambientOptions.indices.contains(ambient) {
             ambientIndex = ambient
         }
+        // 恢复上次拖放的位置（越界时回默认右下角）。
+        var positionRestored = false
+        if let pos = conf["WHALEPET_POS"] {
+            let parts = pos.split(separator: ",").compactMap { Double($0) }
+            if parts.count == 2, let screen = NSScreen.main?.visibleFrame {
+                let origin = NSPoint(x: parts[0], y: parts[1])
+                if screen.insetBy(dx: -window.frame.width / 2, dy: 0).contains(origin) {
+                    window.setFrameOrigin(origin)
+                    positionRestored = true
+                }
+            }
+        }
 
         buildBubble()
 
-        if let screen = NSScreen.main?.visibleFrame {
-            window.setFrameOrigin(NSPoint(x: screen.maxX - petSize - 40, y: screen.minY + 40))
+        if !positionRestored, let screen = NSScreen.main?.visibleFrame {
+            window.setFrameOrigin(NSPoint(x: screen.maxX - currentPetSize - 40, y: screen.minY + 40))
         }
         window.orderFrontRegardless()
 
@@ -463,11 +586,12 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        acpIntentionalStop = true
         acp?.terminate()
     }
 
     private func buildBubble() {
-        bubble = BubblePanel(contentRect: NSRect(origin: .zero, size: bubbleSize),
+        bubble = BubblePanel(contentRect: NSRect(origin: .zero, size: bubbleSmall),
                              styleMask: [.borderless, .nonactivatingPanel],
                              backing: .buffered, defer: false)
         bubble.isOpaque = false
@@ -475,72 +599,126 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         bubble.hasShadow = true
         bubble.level = .floating
 
-        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: bubbleSize))
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: bubbleSmall))
         effect.material = .popover
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = 14
         effect.layer?.masksToBounds = true
+        effect.autoresizingMask = [.width, .height]
         bubble.contentView = effect
 
-        let scroll = NSScrollView(frame: NSRect(x: 10, y: 78, width: bubbleSize.width - 20, height: bubbleSize.height - 88))
+        let scroll = NSScrollView(frame: NSRect(x: 10, y: 82, width: bubbleSmall.width - 20, height: bubbleSmall.height - 92))
         scroll.hasVerticalScroller = true
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
+        scroll.autoresizingMask = [.width, .height]
         transcript = NSTextView(frame: scroll.bounds)
         transcript.isEditable = false
         transcript.drawsBackground = false
         transcript.font = NSFont.systemFont(ofSize: 12)
         transcript.textContainerInset = NSSize(width: 2, height: 4)
         transcript.textContainer?.widthTracksTextView = true
+        transcript.autoresizingMask = [.width]
         scroll.documentView = transcript
         effect.addSubview(scroll)
 
         statusLabel = NSTextField(labelWithString: "")
-        statusLabel.frame = NSRect(x: 12, y: 56, width: bubbleSize.width - 24, height: 16)
+        statusLabel.frame = NSRect(x: 12, y: 58, width: bubbleSmall.width - 160, height: 18)
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.autoresizingMask = [.width, .maxYMargin]
         effect.addSubview(statusLabel)
 
-        input = NSTextField(frame: NSRect(x: 10, y: 12, width: bubbleSize.width - 106, height: 36))
+        let enlarge = NSButton(frame: NSRect(x: bubbleSmall.width - 142, y: 56, width: 62, height: 22))
+        enlarge.title = "放大"
+        enlarge.bezelStyle = .rounded
+        enlarge.font = NSFont.systemFont(ofSize: 10)
+        enlarge.target = self
+        enlarge.action = #selector(toggleBubbleSize(_:))
+        enlarge.autoresizingMask = [.minXMargin, .maxYMargin]
+        effect.addSubview(enlarge)
+
+        let newChat = NSButton(frame: NSRect(x: bubbleSmall.width - 74, y: 56, width: 62, height: 22))
+        newChat.title = "新对话"
+        newChat.bezelStyle = .rounded
+        newChat.font = NSFont.systemFont(ofSize: 10)
+        newChat.target = self
+        newChat.action = #selector(startNewChat)
+        newChat.autoresizingMask = [.minXMargin, .maxYMargin]
+        effect.addSubview(newChat)
+
+        input = NSTextField(frame: NSRect(x: 10, y: 12, width: bubbleSmall.width - 106, height: 40))
         input.placeholderString = "和鲸鱼娘说点什么…"
         input.delegate = self
+        input.autoresizingMask = [.width, .maxYMargin]
         effect.addSubview(input)
 
-        micButton = NSButton(frame: NSRect(x: bubbleSize.width - 92, y: 12, width: 40, height: 36))
+        micButton = NSButton(frame: NSRect(x: bubbleSmall.width - 92, y: 12, width: 40, height: 40))
         micButton.title = "🎤"
         micButton.bezelStyle = .rounded
         micButton.target = self
         micButton.action = #selector(toggleRecording)
+        micButton.autoresizingMask = [.minXMargin, .maxYMargin]
         effect.addSubview(micButton)
 
-        let send = NSButton(frame: NSRect(x: bubbleSize.width - 48, y: 12, width: 38, height: 36))
+        let send = NSButton(frame: NSRect(x: bubbleSmall.width - 48, y: 12, width: 38, height: 40))
         send.title = "发送"
         send.bezelStyle = .rounded
         send.target = self
         send.action = #selector(sendMessage)
+        send.autoresizingMask = [.minXMargin, .maxYMargin]
         effect.addSubview(send)
+        sendButton = send
 
         window.addChildWindow(bubble, ordered: .above)
         positionBubble()
+        synthesizer.delegate = self
     }
 
     private func positionBubble() {
+        let size = bubble.frame.size
         let pet = window.frame
-        var origin = NSPoint(x: pet.midX - bubbleSize.width / 2,
+        var origin = NSPoint(x: pet.midX - size.width / 2,
                              y: pet.maxY + 10)
         if let screen = NSScreen.main?.visibleFrame {
-            if origin.y + bubbleSize.height > screen.maxY {
-                origin.y = pet.minY - bubbleSize.height - 10
+            if origin.y + size.height > screen.maxY {
+                origin.y = pet.minY - size.height - 10
             }
-            origin.x = min(max(origin.x, screen.minX + 4), screen.maxX - bubbleSize.width - 4)
+            origin.x = min(max(origin.x, screen.minX + 4), screen.maxX - size.width - 4)
         }
         bubble.setFrameOrigin(origin)
     }
 
+    @objc private func toggleBubbleSize(_ sender: NSButton) {
+        bubbleEnlarged.toggle()
+        let newSize = bubbleEnlarged ? bubbleLarge : bubbleSmall
+        sender.title = bubbleEnlarged ? "缩小" : "放大"
+        var frame = bubble.frame
+        frame.origin.y = frame.maxY - newSize.height
+        frame.origin.x -= (newSize.width - frame.width) / 2
+        frame.size = newSize
+        bubble.setFrame(frame, display: true)
+    }
+
+    @objc private func startNewChat() {
+        transcript.textStorage?.setAttributedString(NSAttributedString())
+        history = []
+        currentReply = ""
+        acpPersonaSent = false
+        if acpSession != nil {
+            acpSession = nil
+            if let acp { client_newSession(acp) }
+        }
+        appendLine("鲸鱼娘", "呜？新话题新话题～")
+    }
+
     private func toggleBubble() {
         if bubble.isVisible {
+            handsFreeActive = false
+            stopRecording()
+            synthesizer.stopSpeaking(at: .immediate)
             bubble.orderOut(nil)
         } else {
             positionBubble()
@@ -565,6 +743,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         let all = acpModels + apiModels
         keyField?.stringValue = loadConf()["DEEPSEEK_API_KEY"] ?? ""
         modelPopup?.selectItem(at: all.firstIndex(of: preferredModel) ?? 0)
+        repoField?.stringValue = repoPath
+        handsFreeCheckbox?.state = handsFreeEnabled ? .on : .off
         ttsCheckbox?.state = speechEnabled ? .on : .off
         ttsRateSlider?.floatValue = synthesizerRate
         sizePopup?.selectItem(at: petSizeOptions.firstIndex(where: { $0.size == currentPetSize }) ?? 1)
@@ -577,7 +757,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     }
 
     private func buildSettings() {
-        let size = NSSize(width: 340, height: 350)
+        let size = NSSize(width: 340, height: 390)
         let panel = BubblePanel(contentRect: NSRect(origin: .zero, size: size),
                                 styleMask: [.borderless, .nonactivatingPanel],
                                 backing: .buffered, defer: false)
@@ -600,17 +780,24 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             effect.addSubview(l)
         }
 
-        label("API Key：", 306)
-        let keyField = NSSecureTextField(frame: NSRect(x: 100, y: 304, width: 228, height: 26))
+        label("API Key：", 346)
+        let keyField = NSSecureTextField(frame: NSRect(x: 100, y: 344, width: 228, height: 26))
         keyField.placeholderString = "sk-..."
         effect.addSubview(keyField)
         self.keyField = keyField
 
-        label("模型：", 266)
-        let modelPopup = NSPopUpButton(frame: NSRect(x: 100, y: 262, width: 228, height: 28))
+        label("模型：", 306)
+        let modelPopup = NSPopUpButton(frame: NSRect(x: 100, y: 302, width: 228, height: 28))
         modelPopup.addItems(withTitles: acpModels.map { $0 + "（dsh agent）" } + apiModels.map { $0 + "（纯聊天）" })
         effect.addSubview(modelPopup)
         self.modelPopup = modelPopup
+
+        label("dsh 路径：", 266)
+        let repoField = NSTextField(frame: NSRect(x: 100, y: 264, width: 228, height: 26))
+        repoField.placeholderString = defaultDshRepo
+        repoField.font = NSFont.systemFont(ofSize: 11)
+        effect.addSubview(repoField)
+        self.repoField = repoField
 
         label("朗读：", 226)
         let ttsCheckbox = NSButton(checkboxWithTitle: "朗读回复", target: nil, action: nil)
@@ -633,14 +820,20 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         label("小动作：", 146)
         let ambientPopup = NSPopUpButton(frame: NSRect(x: 100, y: 142, width: 228, height: 28))
         ambientPopup.addItems(withTitles: ambientOptions.map(\.title))
-        ambientPopup.toolTip = "待机时随机小动作的频率"
+        ambientPopup.toolTip = "待机时随机小动作的频率（含满屏游走）"
         effect.addSubview(ambientPopup)
         self.ambientPopup = ambientPopup
 
         let loginCheckbox = NSButton(checkboxWithTitle: "开机自动启动", target: nil, action: nil)
-        loginCheckbox.frame = NSRect(x: 100, y: 106, width: 160, height: 24)
+        loginCheckbox.frame = NSRect(x: 100, y: 106, width: 110, height: 24)
         effect.addSubview(loginCheckbox)
         self.loginCheckbox = loginCheckbox
+
+        let handsFreeCheckbox = NSButton(checkboxWithTitle: "连续语音对话", target: nil, action: nil)
+        handsFreeCheckbox.frame = NSRect(x: 214, y: 106, width: 116, height: 24)
+        handsFreeCheckbox.toolTip = "点一次麦克风后：说 → 答 → 自动继续听（需开朗读）"
+        effect.addSubview(handsFreeCheckbox)
+        self.handsFreeCheckbox = handsFreeCheckbox
 
         let hint = NSTextField(labelWithString: "")
         hint.frame = NSRect(x: 12, y: 58, width: 316, height: 40)
@@ -676,10 +869,16 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         let all = acpModels + apiModels
         let index = max(0, min(modelPopup?.indexOfSelectedItem ?? 0, all.count - 1))
         let model = all[index]
+        let repo = (repoField?.stringValue ?? "").trimmingCharacters(in: .whitespaces)
+        let newRepo = repo.isEmpty ? defaultDshRepo : repo
         let conf = loadConf()
-        let agentChanged = model != preferredModel || key != (conf["DEEPSEEK_API_KEY"] ?? "")
+        let agentChanged = model != preferredModel
+            || key != (conf["DEEPSEEK_API_KEY"] ?? "")
+            || newRepo != repoPath
 
         preferredModel = model
+        repoPath = newRepo
+        handsFreeEnabled = handsFreeCheckbox?.state == .on
         speechEnabled = ttsCheckbox?.state == .on
         synthesizerRate = ttsRateSlider?.floatValue ?? 0.52
         let sizeIndex = max(0, min(sizePopup?.indexOfSelectedItem ?? 1, petSizeOptions.count - 1))
@@ -687,14 +886,16 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         ambientIndex = max(0, min(ambientPopup?.indexOfSelectedItem ?? 2, ambientOptions.count - 1))
         nextAmbient = Date().addingTimeInterval(ambientOptions[ambientIndex].range?.lowerBound ?? .infinity)
 
-        saveConf([
-            "DEEPSEEK_API_KEY": key,
-            "WHALEPET_MODEL": model,
-            "WHALEPET_TTS": speechEnabled ? "1" : "0",
-            "WHALEPET_TTS_RATE": String(format: "%.2f", synthesizerRate),
-            "WHALEPET_SIZE": String(Int(newSize)),
-            "WHALEPET_AMBIENT": String(ambientIndex),
-        ])
+        var toSave = conf
+        toSave["DEEPSEEK_API_KEY"] = key
+        toSave["WHALEPET_MODEL"] = model
+        toSave["WHALEPET_DSH_REPO"] = newRepo
+        toSave["WHALEPET_HANDSFREE"] = handsFreeEnabled ? "1" : "0"
+        toSave["WHALEPET_TTS"] = speechEnabled ? "1" : "0"
+        toSave["WHALEPET_TTS_RATE"] = String(format: "%.2f", synthesizerRate)
+        toSave["WHALEPET_SIZE"] = String(Int(newSize))
+        toSave["WHALEPET_AMBIENT"] = String(ambientIndex)
+        saveConf(toSave)
 
         if newSize != currentPetSize {
             currentPetSize = newSize
@@ -706,7 +907,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
 
         settingsHint?.stringValue = "已保存 ✓"
         if agentChanged {
-            // key/model 都是 ACP 子进程启动时注入的，必须重启才能生效。
+            // key/model/仓库路径都是 ACP 子进程启动时注入的，必须重启才能生效。
+            acpIntentionalStop = true
             acp?.terminate()
             acp = nil
             acpSession = nil
@@ -914,7 +1116,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: nodeBin + "/pnpm")
         process.arguments = ["dsh", "plugin", "--profile", "web", "add", pkg]
-        process.currentDirectoryURL = URL(fileURLWithPath: dshRepo)
+        process.currentDirectoryURL = URL(fileURLWithPath: repoPath)
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         env["HOME"] = NSHomeDirectory()
@@ -993,7 +1195,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             statusLabel.stringValue = "正在启动 dsh web……"
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/bash")
-            process.arguments = ["-c", "cd \"\(dshRepo)\" && nohup \"\(nodeBin)/pnpm\" dsh web >/tmp/dsh-web.log 2>&1 &"]
+            process.arguments = ["-c", "cd \"\(repoPath)\" && nohup \"\(nodeBin)/pnpm\" dsh web >/tmp/dsh-web.log 2>&1 &"]
             var env = ProcessInfo.processInfo.environment
             env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
             process.environment = env
@@ -1054,11 +1256,66 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         if action == "idle", Date() > nextAmbient {
             if let range = ambientOptions[ambientIndex].range {
                 nextAmbient = Date().addingTimeInterval(.random(in: range))
-                play(ambientActions.randomElement()!)
+                // 35% 概率满屏游走，否则原地演一个小动作。
+                if Double.random(in: 0...1) < 0.35 {
+                    maybeStartWalk()
+                } else {
+                    play(ambientActions.randomElement()!)
+                }
             } else {
                 nextAmbient = Date.distantFuture
             }
         }
+    }
+
+    // MARK: - Position memory & wandering
+
+    private func savePosition() {
+        var conf = loadConf()
+        let origin = window.frame.origin
+        conf["WHALEPET_POS"] = "\(Int(origin.x)),\(Int(origin.y))"
+        saveConf(conf)
+    }
+
+    /// 待机时在屏幕可见范围内随机挑一个点，播螃蟹走路动画慢慢爬过去。
+    private func maybeStartWalk() {
+        guard walkTimer == nil, !dragging, action == "idle",
+              let screen = NSScreen.main?.visibleFrame else { return }
+        let margin: CGFloat = 20
+        let size = window.frame.size
+        let target = NSPoint(
+            x: .random(in: (screen.minX + margin)...(screen.maxX - size.width - margin)),
+            y: .random(in: (screen.minY + margin)...(screen.maxY - size.height - margin)))
+        let dx = target.x - window.frame.origin.x
+        let dy = target.y - window.frame.origin.y
+        let distance = hypot(dx, dy)
+        guard distance > 60 else { return }
+        let steps = Int(distance / 5)  // 每 tick 5px，约 30 ticks/s
+        walkStepsLeft = steps
+        walkStep = NSPoint(x: dx / CGFloat(steps), y: dy / CGFloat(steps))
+        play("crab")
+        walkTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            self?.walkTick()
+        }
+    }
+
+    private func walkTick() {
+        guard !dragging, walkStepsLeft > 0 else {
+            endWalk(save: true)
+            return
+        }
+        window.setFrameOrigin(NSPoint(x: window.frame.origin.x + walkStep.x,
+                                      y: window.frame.origin.y + walkStep.y))
+        walkStepsLeft -= 1
+        if walkStepsLeft == 0 { endWalk(save: true) }
+    }
+
+    private func endWalk(save: Bool) {
+        walkTimer?.invalidate()
+        walkTimer = nil
+        walkStepsLeft = 0
+        if action == "crab" { play("idle") }
+        if save { savePosition() }
     }
 
     // MARK: - Chat plumbing
@@ -1077,6 +1334,10 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     }
 
     @objc private func sendMessage() {
+        if promptInFlight {
+            stopGeneration()
+            return
+        }
         let text = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         input.stringValue = ""
@@ -1095,6 +1356,24 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         }
     }
 
+    private func setInFlight(_ value: Bool) {
+        promptInFlight = value
+        sendButton?.title = value ? "停止" : "发送"
+    }
+
+    private func stopGeneration() {
+        if let session = acpSession, let acp {
+            // ACP: session/cancel 是通知（无响应），服务端把进行中的 prompt 结算为 cancelled。
+            acp.notify("session/cancel", ["sessionId": session])
+        }
+        directTask?.cancel()
+        directTask = nil
+        setInFlight(false)
+        statusLabel.stringValue = ""
+        appendRaw("（已停止）\n")
+        play("idle")
+    }
+
     // MARK: - ACP (dsh agent)
 
     private func startAcpIfNeeded() {
@@ -1104,8 +1383,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             acpFailed = true
             return
         }
-        guard FileManager.default.fileExists(atPath: dshRepo + "/packages/examples/acp-demo/src/bin.ts") else {
-            statusLabel.stringValue = "找不到 dsh 仓库（\(dshRepo)），回退到普通聊天"
+        guard FileManager.default.fileExists(atPath: repoPath + "/packages/examples/acp-demo/src/bin.ts") else {
+            statusLabel.stringValue = "找不到 dsh 仓库（\(repoPath)），回退到普通聊天"
             acpFailed = true
             return
         }
@@ -1121,7 +1400,22 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             self.acp = nil
             self.acpSession = nil
             self.acpStarting = false
-            if !self.acpFailed {
+            if self.promptInFlight {
+                self.setInFlight(false)
+                self.appendRaw("（dsh 进程退出了）\n")
+            }
+            if self.acpIntentionalStop {
+                self.acpIntentionalStop = false
+                return
+            }
+            // 进程意外退出：自动拉起重试，连续 3 次失败才降级纯聊天。
+            if self.wantsAcp && self.acpRestarts < 3 {
+                self.acpRestarts += 1
+                self.statusLabel.stringValue = "dsh 掉了，自动重启（第 \(self.acpRestarts) 次）……"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.startAcpIfNeeded()
+                }
+            } else if !self.acpFailed {
                 self.acpFailed = true
                 self.statusLabel.stringValue = "dsh 进程退出（代码 \(status)），回退到普通聊天"
             }
@@ -1138,7 +1432,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
                              arguments: ["--import", "tsx",
                                          "packages/examples/acp-demo/src/bin.ts",
                                          "--config", "examples/acp-agent/cordis.yml"],
-                             cwd: dshRepo, env: env)
+                             cwd: repoPath, env: env)
         } catch {
             statusLabel.stringValue = "dsh 启动失败，回退到普通聊天"
             acpStarting = false
@@ -1173,6 +1467,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             case .success(let payload):
                 self.acpSession = payload["sessionId"] as? String
                 self.acpStarting = false
+                self.acpRestarts = 0
                 self.statusLabel.stringValue = ""
                 if let queued = self.queuedPrompt {
                     self.queuedPrompt = nil
@@ -1188,6 +1483,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             return
         }
         play("look")
+        setInFlight(true)
         statusLabel.stringValue = "dsh agent 干活中……"
         currentReply = ""
 
@@ -1196,20 +1492,22 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             prompt = acpPersonaPrefix + "\n\n" + text
             acpPersonaSent = true
         }
+        replyStartLocation = transcript.textStorage?.length ?? 0
         appendRaw("鲸鱼娘：")
 
         acp.call("session/prompt",
                  ["sessionId": session, "prompt": [["type": "text", "text": prompt]]],
                  timeout: 600) { [weak self] result in
             guard let self else { return }
+            self.setInFlight(false)
             self.statusLabel.stringValue = ""
             switch result {
             case .success:
-                self.appendRaw("\n")
                 if self.selftest {
                     self.selftestWrite("selftest: REPLY — " + self.currentReply)
                     exit(0)
                 }
+                self.finalizeReply()
                 self.speak(self.currentReply)
                 self.play("happy")
             case .failure(let error):
@@ -1221,6 +1519,17 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
                 self.play("angry")
             }
         }
+    }
+
+    /// 流式接收时原文追加，回复结束后把最后一条替换成 markdown 渲染版。
+    private func finalizeReply() {
+        guard let storage = transcript.textStorage else { return }
+        let rendered = NSMutableAttributedString(string: "鲸鱼娘：",
+                                                 attributes: [.font: NSFont.systemFont(ofSize: 12)])
+        rendered.append(renderMarkdown(currentReply))
+        let range = NSRange(location: replyStartLocation, length: storage.length - replyStartLocation)
+        storage.replaceCharacters(in: range, with: rendered)
+        transcript.scrollToEndOfDocument(nil)
     }
 
     private func handleAcpEvent(_ message: [String: Any]) {
@@ -1260,6 +1569,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         }
 
         statusLabel.stringValue = "鲸鱼娘思考中……"
+        setInFlight(true)
         var request = URLRequest(url: URL(string: "https://api.deepseek.com/chat/completions")!)
         request.httpMethod = "POST"
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -1270,12 +1580,18 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         request.httpBody = try? JSONEncoder().encode(body)
         request.timeoutInterval = 60
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async { self?.handleReply(data: data, response: response, error: error) }
-        }.resume()
+        }
+        directTask = task
+        task.resume()
     }
 
     private func handleReply(data: Data?, response: URLResponse?, error: Error?) {
+        directTask = nil
+        // 用户手动停止后迟到的响应直接丢弃。
+        guard promptInFlight else { return }
+        setInFlight(false)
         if let error {
             statusLabel.stringValue = "网络错误：\(error.localizedDescription)"
             play("angry")
@@ -1309,13 +1625,25 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         synthesizer.speak(utterance)
     }
 
+    /// 连续语音对话：朗读完自动开始听下一轮。
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        guard handsFreeActive, bubble.isVisible else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.handsFreeActive, !self.audioEngine.isRunning else { return }
+            self.startRecording()
+        }
+    }
+
     // MARK: - Speech input (STT)
 
     @objc private func toggleRecording() {
         if audioEngine.isRunning {
+            handsFreeActive = false
             stopRecording()
             return
         }
+        // 手动点麦克风：开启了「连续语音对话」则进入免提循环。
+        handsFreeActive = handsFreeEnabled
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
             DispatchQueue.main.async {
                 guard status == .authorized else {
@@ -1349,7 +1677,14 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
                 guard let self else { return }
                 if let result {
                     self.input.stringValue = result.bestTranscription.formattedString
-                    if result.isFinal { self.stopRecording() }
+                    if result.isFinal {
+                        let heard = self.input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        self.stopRecording()
+                        // 免提循环：说完自动发送，等回复朗读完再听下一轮。
+                        if self.handsFreeActive, !heard.isEmpty {
+                            self.sendMessage()
+                        }
+                    }
                 }
                 if error != nil { self.stopRecording() }
             }
