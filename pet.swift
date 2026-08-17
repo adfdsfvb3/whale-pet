@@ -407,7 +407,7 @@ final class ResizeStripView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         // 右下角画三条斜线提示可拖拽。
-        NSColor.tertiaryLabelColor.setStroke()
+        NSColor.secondaryLabelColor.setStroke()
         for offset in stride(from: 4, through: 12, by: 4) {
             let path = NSBezierPath()
             path.move(to: NSPoint(x: bounds.maxX - CGFloat(offset), y: bounds.maxY - 1))
@@ -596,9 +596,12 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         window.orderFrontRegardless()
 
         play("idle")
-        timer = Timer.scheduledTimer(withTimeInterval: fps, repeats: true) { [weak self] _ in
+        // 挂到 common 模式：右键菜单/拖拽跟踪期间动画定时器也能继续触发。
+        let frameTimer = Timer(timeInterval: fps, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        RunLoop.main.add(frameTimer, forMode: .common)
+        timer = frameTimer
 
         if selftest {
             selftestWrite("selftest: boot")
@@ -641,7 +644,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         effect.autoresizingMask = [.width, .height]
         bubble.contentView = effect
 
-        let scroll = NSScrollView(frame: NSRect(x: 10, y: 82, width: bubbleSmall.width - 20, height: bubbleSmall.height - 92))
+        let scroll = NSScrollView(frame: NSRect(x: 10, y: 82, width: bubbleSmall.width - 20, height: bubbleSmall.height - 122))
         scroll.hasVerticalScroller = true
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
@@ -655,6 +658,24 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         transcript.autoresizingMask = [.width]
         scroll.documentView = transcript
         effect.addSubview(scroll)
+
+        // 顶部标题栏：× 关闭 + 标题。
+        let closeChat = NSButton(frame: NSRect(x: 8, y: bubbleSmall.height - 32, width: 24, height: 24))
+        closeChat.title = "✕"
+        closeChat.bezelStyle = .rounded
+        closeChat.font = NSFont.systemFont(ofSize: 11)
+        closeChat.target = self
+        closeChat.action = #selector(closeBubbleAction)
+        closeChat.autoresizingMask = [.maxXMargin, .minYMargin]
+        closeChat.toolTip = "关闭对话框"
+        effect.addSubview(closeChat)
+
+        let chatTitle = NSTextField(labelWithString: "鲸鱼娘")
+        chatTitle.frame = NSRect(x: 38, y: bubbleSmall.height - 30, width: 200, height: 20)
+        chatTitle.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        chatTitle.textColor = .secondaryLabelColor
+        chatTitle.autoresizingMask = [.maxXMargin, .minYMargin]
+        effect.addSubview(chatTitle)
 
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.frame = NSRect(x: 12, y: 58, width: bubbleSmall.width - 160, height: 18)
@@ -673,8 +694,9 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         newChat.autoresizingMask = [.minXMargin, .maxYMargin]
         effect.addSubview(newChat)
 
-        let strip = ResizeStripView(frame: NSRect(x: 0, y: 0, width: bubbleSmall.width, height: 8))
+        let strip = ResizeStripView(frame: NSRect(x: 0, y: 0, width: bubbleSmall.width, height: 12))
         strip.autoresizingMask = [.width, .maxYMargin]
+        strip.toolTip = "拖动调整对话框大小"
         strip.onResize = { [weak self] size in
             guard let self else { return }
             var frame = self.bubble.frame
@@ -725,6 +747,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         }
         bubble.setFrameOrigin(origin)
     }
+
+    @objc private func closeBubbleAction() { toggleBubble() }
 
     @objc private func startNewChat() {
         transcript.textStorage?.setAttributedString(NSAttributedString())
@@ -1331,9 +1355,11 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         walkStepsLeft = steps
         walkStep = NSPoint(x: dx / CGFloat(steps), y: dy / CGFloat(steps))
         play("crab")
-        walkTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+        let walk = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             self?.walkTick()
         }
+        RunLoop.main.add(walk, forMode: .common)
+        walkTimer = walk
         return true
     }
 
