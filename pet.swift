@@ -169,7 +169,7 @@ func loadConf() -> [String: String] {
 
 /// Write ~/.whalepet.conf with owner-only permissions. Keeps only known keys.
 func saveConf(_ conf: [String: String]) {
-    let order = ["DEEPSEEK_API_KEY", "WHALEPET_MODEL", "WHALEPET_TTS", "WHALEPET_TTS_RATE", "WHALEPET_SIZE", "WHALEPET_AMBIENT", "WHALEPET_POS", "WHALEPET_DSH_REPO", "WHALEPET_HANDSFREE"]
+    let order = ["DEEPSEEK_API_KEY", "WHALEPET_MODEL", "WHALEPET_TTS", "WHALEPET_TTS_RATE", "WHALEPET_SIZE", "WHALEPET_AMBIENT", "WHALEPET_WALK", "WHALEPET_POS", "WHALEPET_DSH_REPO", "WHALEPET_HANDSFREE"]
     let lines = order.compactMap { key -> String? in
         guard let value = conf[key], !value.isEmpty else { return nil }
         return "\(key)=\(value)"
@@ -386,6 +386,38 @@ final class BubblePanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// Bottom strip of the chat bubble: drag to resize freely (dx → width, -dy → height).
+final class ResizeStripView: NSView {
+    var onResize: ((NSSize) -> Void)?
+    private var startSize = NSSize.zero
+    private var startMouse = NSPoint.zero
+
+    override func mouseDown(with event: NSEvent) {
+        startSize = window?.frame.size ?? .zero
+        startMouse = NSEvent.mouseLocation
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let dx = NSEvent.mouseLocation.x - startMouse.x
+        let dy = NSEvent.mouseLocation.y - startMouse.y
+        let size = NSSize(width: min(max(startSize.width + dx, 300), 900),
+                          height: min(max(startSize.height - dy, 280), 900))
+        onResize?(size)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // 右下角画三条斜线提示可拖拽。
+        NSColor.tertiaryLabelColor.setStroke()
+        for offset in stride(from: 4, through: 12, by: 4) {
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: bounds.maxX - CGFloat(offset), y: bounds.maxY - 1))
+            path.line(to: NSPoint(x: bounds.maxX - 1, y: bounds.maxY - CGFloat(offset)))
+            path.lineWidth = 1.5
+            path.stroke()
+        }
+    }
+}
+
 // MARK: - Controller
 
 final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate, AVSpeechSynthesizerDelegate {
@@ -428,6 +460,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     private var loginCheckbox: NSButton?
     private var repoField: NSTextField?
     private var handsFreeCheckbox: NSButton?
+    private var walkCheckbox: NSButton?
     private var preferredModel: String = defaultModel
     private var currentPetSize: CGFloat = petSize
     private var ambientIndex = 2  // 正常
@@ -443,9 +476,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     private var promptInFlight = false
     private var acpRestarts = 0
     private var replyStartLocation = 0
-    private var bubbleEnlarged = false
     private let bubbleSmall = NSSize(width: 340, height: 380)
-    private let bubbleLarge = NSSize(width: 560, height: 600)
 
     // Wandering
     private var walkTimer: Timer?
@@ -453,6 +484,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     private var walkStep = NSPoint.zero
     private var walkStepsLeft = 0
     private var dragging = false
+    private var walkEnabled = true
 
     // Plugins
     private var pluginsPanel: BubblePanel?
@@ -542,6 +574,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         if let ambient = Int(conf["WHALEPET_AMBIENT"] ?? ""), ambientOptions.indices.contains(ambient) {
             ambientIndex = ambient
         }
+        walkEnabled = conf["WHALEPET_WALK"] != "0"
         // 恢复上次拖放的位置（越界时回默认右下角）。
         var positionRestored = false
         if let pos = conf["WHALEPET_POS"] {
@@ -631,15 +664,6 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         statusLabel.autoresizingMask = [.width, .maxYMargin]
         effect.addSubview(statusLabel)
 
-        let enlarge = NSButton(frame: NSRect(x: bubbleSmall.width - 142, y: 56, width: 62, height: 22))
-        enlarge.title = "放大"
-        enlarge.bezelStyle = .rounded
-        enlarge.font = NSFont.systemFont(ofSize: 10)
-        enlarge.target = self
-        enlarge.action = #selector(toggleBubbleSize(_:))
-        enlarge.autoresizingMask = [.minXMargin, .maxYMargin]
-        effect.addSubview(enlarge)
-
         let newChat = NSButton(frame: NSRect(x: bubbleSmall.width - 74, y: 56, width: 62, height: 22))
         newChat.title = "新对话"
         newChat.bezelStyle = .rounded
@@ -648,6 +672,17 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         newChat.action = #selector(startNewChat)
         newChat.autoresizingMask = [.minXMargin, .maxYMargin]
         effect.addSubview(newChat)
+
+        let strip = ResizeStripView(frame: NSRect(x: 0, y: 0, width: bubbleSmall.width, height: 8))
+        strip.autoresizingMask = [.width, .maxYMargin]
+        strip.onResize = { [weak self] size in
+            guard let self else { return }
+            var frame = self.bubble.frame
+            frame.origin.y = frame.maxY - size.height
+            frame.size = size
+            self.bubble.setFrame(frame, display: true)
+        }
+        effect.addSubview(strip)
 
         input = NSTextField(frame: NSRect(x: 10, y: 12, width: bubbleSmall.width - 106, height: 40))
         input.placeholderString = "和鲸鱼娘说点什么…"
@@ -691,17 +726,6 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         bubble.setFrameOrigin(origin)
     }
 
-    @objc private func toggleBubbleSize(_ sender: NSButton) {
-        bubbleEnlarged.toggle()
-        let newSize = bubbleEnlarged ? bubbleLarge : bubbleSmall
-        sender.title = bubbleEnlarged ? "缩小" : "放大"
-        var frame = bubble.frame
-        frame.origin.y = frame.maxY - newSize.height
-        frame.origin.x -= (newSize.width - frame.width) / 2
-        frame.size = newSize
-        bubble.setFrame(frame, display: true)
-    }
-
     @objc private func startNewChat() {
         transcript.textStorage?.setAttributedString(NSAttributedString())
         history = []
@@ -721,6 +745,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             synthesizer.stopSpeaking(at: .immediate)
             bubble.orderOut(nil)
         } else {
+            endWalk(save: true)
             positionBubble()
             bubble.orderFrontRegardless()
             bubble.makeFirstResponder(input)
@@ -749,6 +774,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         ttsRateSlider?.floatValue = synthesizerRate
         sizePopup?.selectItem(at: petSizeOptions.firstIndex(where: { $0.size == currentPetSize }) ?? 1)
         ambientPopup?.selectItem(at: ambientIndex)
+        walkCheckbox?.state = walkEnabled ? .on : .off
         loginCheckbox?.state = FileManager.default.fileExists(atPath: launchAgentPath) ? .on : .off
         settingsHint?.stringValue = "保存后立即生效；切换模型或 key 会重启 dsh agent"
         let pet = window.frame
@@ -818,11 +844,17 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         self.sizePopup = sizePopup
 
         label("小动作：", 146)
-        let ambientPopup = NSPopUpButton(frame: NSRect(x: 100, y: 142, width: 228, height: 28))
+        let ambientPopup = NSPopUpButton(frame: NSRect(x: 100, y: 142, width: 140, height: 28))
         ambientPopup.addItems(withTitles: ambientOptions.map(\.title))
-        ambientPopup.toolTip = "待机时随机小动作的频率（含满屏游走）"
+        ambientPopup.toolTip = "待机时随机小动作的频率"
         effect.addSubview(ambientPopup)
         self.ambientPopup = ambientPopup
+
+        let walkCheckbox = NSButton(checkboxWithTitle: "满屏游走", target: nil, action: nil)
+        walkCheckbox.frame = NSRect(x: 246, y: 144, width: 88, height: 24)
+        walkCheckbox.toolTip = "待机时随机在屏幕上爬来爬去（对话框打开时不游走）"
+        effect.addSubview(walkCheckbox)
+        self.walkCheckbox = walkCheckbox
 
         let loginCheckbox = NSButton(checkboxWithTitle: "开机自动启动", target: nil, action: nil)
         loginCheckbox.frame = NSRect(x: 100, y: 106, width: 110, height: 24)
@@ -885,6 +917,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         let newSize = petSizeOptions[sizeIndex].size
         ambientIndex = max(0, min(ambientPopup?.indexOfSelectedItem ?? 2, ambientOptions.count - 1))
         nextAmbient = Date().addingTimeInterval(ambientOptions[ambientIndex].range?.lowerBound ?? .infinity)
+        walkEnabled = walkCheckbox?.state == .on
+        if !walkEnabled { endWalk(save: false) }
 
         var toSave = conf
         toSave["DEEPSEEK_API_KEY"] = key
@@ -895,6 +929,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         toSave["WHALEPET_TTS_RATE"] = String(format: "%.2f", synthesizerRate)
         toSave["WHALEPET_SIZE"] = String(Int(newSize))
         toSave["WHALEPET_AMBIENT"] = String(ambientIndex)
+        toSave["WHALEPET_WALK"] = walkEnabled ? "1" : "0"
         saveConf(toSave)
 
         if newSize != currentPetSize {
@@ -1256,9 +1291,9 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         if action == "idle", Date() > nextAmbient {
             if let range = ambientOptions[ambientIndex].range {
                 nextAmbient = Date().addingTimeInterval(.random(in: range))
-                // 35% 概率满屏游走，否则原地演一个小动作。
-                if Double.random(in: 0...1) < 0.35 {
-                    maybeStartWalk()
+                // 35% 概率满屏游走（对话框打开时不游走），否则原地演一个小动作。
+                if walkEnabled, Double.random(in: 0...1) < 0.35, maybeStartWalk() {
+                    // started walking
                 } else {
                     play(ambientActions.randomElement()!)
                 }
@@ -1278,9 +1313,11 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     }
 
     /// 待机时在屏幕可见范围内随机挑一个点，播螃蟹走路动画慢慢爬过去。
-    private func maybeStartWalk() {
-        guard walkTimer == nil, !dragging, action == "idle",
-              let screen = NSScreen.main?.visibleFrame else { return }
+    /// 对话框打开时不游走（气泡会挡住后面的窗口）。返回是否真的开始游走。
+    @discardableResult
+    private func maybeStartWalk() -> Bool {
+        guard walkTimer == nil, !dragging, action == "idle", !bubble.isVisible,
+              let screen = NSScreen.main?.visibleFrame else { return false }
         let margin: CGFloat = 20
         let size = window.frame.size
         let target = NSPoint(
@@ -1289,7 +1326,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         let dx = target.x - window.frame.origin.x
         let dy = target.y - window.frame.origin.y
         let distance = hypot(dx, dy)
-        guard distance > 60 else { return }
+        guard distance > 60 else { return false }
         let steps = Int(distance / 5)  // 每 tick 5px，约 30 ticks/s
         walkStepsLeft = steps
         walkStep = NSPoint(x: dx / CGFloat(steps), y: dy / CGFloat(steps))
@@ -1297,6 +1334,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         walkTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             self?.walkTick()
         }
+        return true
     }
 
     private func walkTick() {
