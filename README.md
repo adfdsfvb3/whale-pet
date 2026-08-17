@@ -8,12 +8,21 @@
 
 - **桌面悬浮**：透明置顶窗口，所有桌面空间可见，不占 Dock
 - **拖动**：按住拖动到屏幕任意位置（拖动时播放悬空挣扎动画）
-- **单击**：弹出对话气泡，直连 DeepSeek API 聊天（带上下文记忆）
+- **单击**：弹出对话气泡，和鲸鱼娘聊天
+- **完整 dsh agent**：对话默认接入本地 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的 ACP agent —— 能读写文件、执行命令、派生子代理，和 dsh web 端是同一个"大脑"；dsh 不可用时自动回退到 DeepSeek API 纯聊天
 - **语音输入**：气泡里点 🎤 说话，macOS 原生语音识别（中文）实时转文字
-- **语音朗读**：回复自动用中文语音读出来
+- **语音朗读**：回复自动用中文语音读出来（超长回复只念前 200 字）
 - **双击**：随机卖萌（开心跃动 / 害羞 / 傲娇生气）
 - **随机小动作**：待机时每隔 25~60 秒随机表演（东张西望、哼歌、伸懒腰、玩魔方、螃蟹走路）
 - **右键菜单**：打开/关闭对话、退出
+
+### dsh agent 模式说明
+
+- 需要本机已 clone 并构建 deepseek-harness（路径在 `pet.swift` 的 `dshRepo` 常量，默认 `/Users/miao/deepseek-harness`，按需修改）
+- 首次打开对话框时自动拉起 ACP server 子进程（`node --import tsx packages/examples/acp-demo/src/bin.ts`），通过 stdin/stdout 上的 ndjson JSON-RPC 通信
+- **安全边界**：agent 的文件系统和命令执行被沙箱限制在 `~/whale-pet/workspace`；一次性权限请求自动允许（仅在该沙箱范围内）
+- 想让她操作别的目录，直接对话里说明即可——她会先复制/移动到 workspace 内处理
+- `WHALEPET_SELFTEST=1 open dist/WhalePet.app` 可无界面自测 ACP 链路（结果写 `/tmp/whalepet-selftest.log`）
 
 ## 构建
 
@@ -49,8 +58,9 @@ chmod 600 ~/.whalepet.conf
 ## 项目结构
 
 ```
-pet.swift          应用全部源码（AppKit，单文件）
+pet.swift          应用全部源码（AppKit，单文件）：宠物动画 + 对话气泡 + ACP 客户端 + 语音
 extract_frames.py  帧提取脚本：webm → 抠黑底透明 PNG 序列
+test-acp.py        ACP 链路独立冒烟测试（python3 test-acp.py）
 build.sh           一键构建脚本
 Info.plist         app 包配置（含权限说明文案）
 ```

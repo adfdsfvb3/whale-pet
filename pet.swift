@@ -1,7 +1,9 @@
 // WhalePet — 鲸鱼娘桌面宠物
 // 无边框透明置顶窗，播放 dsh-pet 插件的帧动画；可拖动、点击出对话气泡。
-// 对话直连 DeepSeek API（key 读自 ~/.whalepet.conf），语音输入用 macOS 原生
-// SFSpeechRecognizer（中文），回复用 AVSpeechSynthesizer 朗读。
+// 对话优先走本地 dsh（DeepSeek Harness）的 ACP agent —— 有完整的工具能力
+// （文件/命令/子代理，沙箱限制在 ~/whale-pet/workspace）；ACP 启动失败时
+// 回退到直连 DeepSeek API 的纯聊天。语音输入用 macOS 原生 SFSpeechRecognizer
+// （中文），回复用 AVSpeechSynthesizer 朗读。
 // 帧素材由 extract_frames.py 从 dsh-pet 的 webm 提取（12fps, 240px, 透明底）。
 
 import AVFoundation
@@ -16,6 +18,13 @@ let clickActions = ["happy", "shy", "angry"]
 let ambientActions = ["look", "hum", "stretch", "cube", "crab"]
 
 let systemPrompt = "你是「鲸鱼娘」，一只穿女仆装的深海鲸鱼少女，住在用户的 Mac 桌面上当宠物。说话软萌、简短（每次一两句话），偶尔带「呜」「咕噜」等语气词。始终用中文回复。"
+
+/// Prepended to the first ACP prompt so the harness agent keeps the pet persona
+/// while retaining its full tool capabilities.
+let acpPersonaPrefix = "（对话设定：你是住在用户 Mac 桌面上的女仆装鲸鱼娘桌面宠物，说话软萌、用中文；工具结果照实汇报，但日常对话保持简短可爱。以下开始是用户的话。）"
+
+let dshRepo = "/Users/miao/deepseek-harness"
+let nodeBin = "/Users/miao/.nvm/versions/node/v24.16.0/bin"
 
 struct ChatMessage: Codable {
     let role: String
@@ -49,6 +58,146 @@ func loadAPIKey() -> String? {
     }
     return ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"]
 }
+
+// MARK: - Minimal ACP (Agent Client Protocol) client over stdio ndjson
+
+enum AcpError: Error, LocalizedError {
+    case boot(String)
+    case rpc(String)
+    case timeout(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .boot(let detail): return "dsh 启动失败：\(detail)"
+        case .rpc(let detail): return detail
+        case .timeout(let method): return "\(method) 超时"
+        }
+    }
+}
+
+/// Speaks newline-delimited JSON-RPC 2.0 with a child process. All completion
+/// handlers and event callbacks fire on the main queue.
+final class AcpClient {
+    var onEvent: ([String: Any]) -> Void = { _ in }
+    var onExit: (Int32) -> Void = { _ in }
+
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var buffer = Data()
+    private var nextId = 0
+    private let lock = NSLock()
+    private var pending: [Int: (Result<[String: Any], AcpError>) -> Void] = [:]
+    private var timers: [Int: DispatchWorkItem] = [:]
+
+    func start(executable: String, arguments: [String], cwd: String, env: [String: String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        process.environment = env
+        let outPipe = Pipe()
+        let inPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardInput = inPipe
+        process.standardError = errPipe
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            self?.readAvailable(handle)
+        }
+        // Drain stderr so the child never blocks on a full pipe.
+        errPipe.fileHandleForReading.readabilityHandler = { handle in _ = handle.availableData }
+        process.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async { self?.onExit(proc.terminationStatus) }
+        }
+        try process.run()
+        self.process = process
+        stdinHandle = inPipe.fileHandleForWriting
+    }
+
+    func call(_ method: String, _ params: [String: Any], timeout: TimeInterval = 60,
+              completion: @escaping (Result<[String: Any], AcpError>) -> Void) {
+        lock.lock()
+        nextId += 1
+        let id = nextId
+        pending[id] = completion
+        lock.unlock()
+
+        let timer = DispatchWorkItem { [weak self] in
+            self?.fail(id, .timeout(method))
+        }
+        lock.lock()
+        timers[id] = timer
+        lock.unlock()
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timer)
+
+        write(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+    }
+
+    func respond(_ id: Int, result: [String: Any]) {
+        write(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    func terminate() {
+        process?.terminate()
+    }
+
+    private func write(_ object: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        var line = data
+        line.append(0x0A)
+        stdinHandle?.write(line)
+    }
+
+    private func fail(_ id: Int, _ error: AcpError) {
+        lock.lock()
+        let completion = pending.removeValue(forKey: id)
+        timers.removeValue(forKey: id)?.cancel()
+        lock.unlock()
+        guard let completion else { return }
+        DispatchQueue.main.async { completion(.failure(error)) }
+    }
+
+    private func readAvailable(_ handle: FileHandle) {
+        let data = handle.availableData
+        if data.isEmpty { return }
+        lock.lock()
+        buffer.append(data)
+        var lines: [Data] = []
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            lines.append(buffer.prefix(newline))
+            buffer.removeSubrange(...newline)
+        }
+        lock.unlock()
+        for line in lines {
+            guard let object = try? JSONSerialization.jsonObject(with: line),
+                  let message = object as? [String: Any] else { continue }
+            dispatch(message)
+        }
+    }
+
+    private func dispatch(_ message: [String: Any]) {
+        if let id = message["id"] as? Int, message["result"] != nil || message["error"] != nil {
+            lock.lock()
+            let completion = pending.removeValue(forKey: id)
+            timers.removeValue(forKey: id)?.cancel()
+            lock.unlock()
+            guard let completion else { return }
+            DispatchQueue.main.async {
+                if let error = message["error"] as? [String: Any] {
+                    completion(.failure(.rpc(error["message"] as? String ?? "未知错误")))
+                } else if let result = message["result"] as? [String: Any] {
+                    completion(.success(result))
+                } else {
+                    completion(.success([:]))
+                }
+            }
+            return
+        }
+        DispatchQueue.main.async { self.onEvent(message) }
+    }
+}
+
+// MARK: - Pet view (mouse handling)
 
 final class PetView: NSImageView {
     var onDragStateChange: ((Bool) -> Void)?
@@ -97,6 +246,8 @@ final class BubblePanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+// MARK: - Controller
+
 final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var window: NSPanel!
     private var view: PetView!
@@ -112,7 +263,18 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     private var timer: Timer?
     private var nextAmbient = Date().addingTimeInterval(.random(in: 25...50))
 
+    // Direct-API fallback state
     private var history: [ChatMessage] = []
+
+    // ACP state
+    private var acp: AcpClient?
+    private var acpSession: String?
+    private var acpStarting = false
+    private var acpFailed = false
+    private var acpPersonaSent = false
+    private var queuedPrompt: String?
+    private var currentReply = ""
+
     private let synthesizer = AVSpeechSynthesizer()
     private var speechEnabled = true
 
@@ -120,6 +282,27 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+
+    private var workspace: String {
+        NSHomeDirectory() + "/whale-pet/workspace"
+    }
+
+    /// WHALEPET_SELFTEST=1 runs a headless ACP smoke test at launch: boots the
+    /// agent, sends one prompt, logs the outcome to /tmp/whalepet-selftest.log
+    /// and exits. Used to verify the ACP path without UI interaction.
+    private let selftest = ProcessInfo.processInfo.environment["WHALEPET_SELFTEST"] == "1"
+    private let selftestLog = "/tmp/whalepet-selftest.log"
+
+    private func selftestWrite(_ text: String) {
+        let line = text + "\n"
+        if let handle = FileHandle(forWritingAtPath: selftestLog) {
+            handle.seekToEndOfFile()
+            handle.write(line.data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: selftestLog, contents: line.data(using: .utf8))
+        }
+    }
 
     // MARK: - App setup
 
@@ -156,6 +339,27 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         timer = Timer.scheduledTimer(withTimeInterval: fps, repeats: true) { [weak self] _ in
             self?.tick()
         }
+
+        if selftest {
+            selftestWrite("selftest: boot")
+            startAcpIfNeeded()
+            Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] poll in
+                guard let self else { return }
+                if self.acpSession != nil {
+                    poll.invalidate()
+                    self.selftestWrite("selftest: session ready")
+                    self.sendAcp("用一句话介绍你自己。")
+                } else if self.acpFailed {
+                    poll.invalidate()
+                    self.selftestWrite("selftest: ACP FAILED — " + self.statusLabel.stringValue)
+                    exit(1)
+                }
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        acp?.terminate()
     }
 
     private func buildBubble() {
@@ -241,6 +445,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             if transcript.string.isEmpty {
                 appendLine("鲸鱼娘", "呜？找人家什么事呀～")
             }
+            startAcpIfNeeded()
         }
     }
 
@@ -281,11 +486,14 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         }
     }
 
-    // MARK: - Chat
+    // MARK: - Chat plumbing
 
     private func appendLine(_ who: String, _ text: String) {
-        let line = "\(who)：\(text)\n"
-        transcript.textStorage?.append(NSAttributedString(string: line))
+        appendRaw("\(who)：\(text)\n")
+    }
+
+    private func appendRaw(_ text: String) {
+        transcript.textStorage?.append(NSAttributedString(string: text))
         transcript.scrollToEndOfDocument(nil)
     }
 
@@ -298,6 +506,172 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         guard !text.isEmpty else { return }
         input.stringValue = ""
         appendLine("你", text)
+
+        if acpFailed {
+            sendDirect(text)
+        } else if acpSession != nil {
+            sendAcp(text)
+        } else {
+            queuedPrompt = text
+            statusLabel.stringValue = "dsh 还在启动，醒来自动发送……"
+            startAcpIfNeeded()
+        }
+    }
+
+    // MARK: - ACP (dsh agent)
+
+    private func startAcpIfNeeded() {
+        guard acp == nil, !acpStarting, !acpFailed else { return }
+        guard let key = loadAPIKey() else {
+            statusLabel.stringValue = "没有 API key：请把 DEEPSEEK_API_KEY=sk-... 写进 ~/.whalepet.conf"
+            acpFailed = true
+            return
+        }
+        guard FileManager.default.fileExists(atPath: dshRepo + "/packages/examples/acp-demo/src/bin.ts") else {
+            statusLabel.stringValue = "找不到 dsh 仓库（\(dshRepo)），回退到普通聊天"
+            acpFailed = true
+            return
+        }
+        acpStarting = true
+        statusLabel.stringValue = "正在唤醒 dsh agent……"
+
+        try? FileManager.default.createDirectory(atPath: workspace, withIntermediateDirectories: true)
+
+        let client = AcpClient()
+        client.onEvent = { [weak self] message in self?.handleAcpEvent(message) }
+        client.onExit = { [weak self] status in
+            guard let self else { return }
+            self.acp = nil
+            self.acpSession = nil
+            self.acpStarting = false
+            if !self.acpFailed {
+                self.acpFailed = true
+                self.statusLabel.stringValue = "dsh 进程退出（代码 \(status)），回退到普通聊天"
+            }
+        }
+
+        var env = ProcessInfo.processInfo.environment
+        env["DEEPSEEK_API_KEY"] = key
+        env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        env["HOME"] = NSHomeDirectory()
+
+        do {
+            try client.start(executable: nodeBin + "/node",
+                             arguments: ["--import", "tsx",
+                                         "packages/examples/acp-demo/src/bin.ts",
+                                         "--config", "examples/acp-agent/cordis.yml"],
+                             cwd: dshRepo, env: env)
+        } catch {
+            statusLabel.stringValue = "dsh 启动失败，回退到普通聊天"
+            acpStarting = false
+            acpFailed = true
+            return
+        }
+        acp = client
+
+        client.call("initialize", ["protocolVersion": 1, "clientCapabilities": [:]], timeout: 120) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.statusLabel.stringValue = error.localizedDescription
+                self.acpStarting = false
+                self.acpFailed = true
+                self.acp?.terminate()
+                self.acp = nil
+            case .success:
+                self.client_newSession(client)
+            }
+        }
+    }
+
+    private func client_newSession(_ client: AcpClient) {
+        client.call("session/new", ["cwd": workspace, "mcpServers": []], timeout: 120) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.statusLabel.stringValue = error.localizedDescription
+                self.acpStarting = false
+                self.acpFailed = true
+            case .success(let payload):
+                self.acpSession = payload["sessionId"] as? String
+                self.acpStarting = false
+                self.statusLabel.stringValue = ""
+                if let queued = self.queuedPrompt {
+                    self.queuedPrompt = nil
+                    self.sendAcp(queued)
+                }
+            }
+        }
+    }
+
+    private func sendAcp(_ text: String) {
+        guard let session = acpSession, let acp else {
+            sendDirect(text)
+            return
+        }
+        play("look")
+        statusLabel.stringValue = "dsh agent 干活中……"
+        currentReply = ""
+
+        var prompt = text
+        if !acpPersonaSent {
+            prompt = acpPersonaPrefix + "\n\n" + text
+            acpPersonaSent = true
+        }
+        appendRaw("鲸鱼娘：")
+
+        acp.call("session/prompt",
+                 ["sessionId": session, "prompt": [["type": "text", "text": prompt]]],
+                 timeout: 600) { [weak self] result in
+            guard let self else { return }
+            self.statusLabel.stringValue = ""
+            switch result {
+            case .success:
+                self.appendRaw("\n")
+                if self.selftest {
+                    self.selftestWrite("selftest: REPLY — " + self.currentReply)
+                    exit(0)
+                }
+                self.speak(self.currentReply)
+                self.play("happy")
+            case .failure(let error):
+                self.appendRaw("（出错了：\(error.localizedDescription)）\n")
+                if self.selftest {
+                    self.selftestWrite("selftest: PROMPT FAILED — \(error.localizedDescription)")
+                    exit(1)
+                }
+                self.play("angry")
+            }
+        }
+    }
+
+    private func handleAcpEvent(_ message: [String: Any]) {
+        guard let method = message["method"] as? String else { return }
+        switch method {
+        case "session/update":
+            guard let params = message["params"] as? [String: Any],
+                  let update = params["update"] as? [String: Any],
+                  update["sessionUpdate"] as? String == "agent_message_chunk",
+                  let content = update["content"] as? [String: Any],
+                  let text = content["text"] as? String, !text.isEmpty else { return }
+            currentReply += text
+            appendRaw(text)
+        case "session/request_permission":
+            // 沙箱已把文件/命令限制在 workspace 内，一次性权限自动允许。
+            guard let id = message["id"] as? Int,
+                  let params = message["params"] as? [String: Any],
+                  let options = params["options"] as? [[String: Any]] else { return }
+            let chosen = options.first { ($0["kind"] as? String ?? "").hasPrefix("allow") } ?? options.first
+            guard let optionId = chosen?["optionId"] as? String else { return }
+            acp?.respond(id, result: ["outcome": ["outcome": "selected", "optionId": optionId]])
+        default:
+            break
+        }
+    }
+
+    // MARK: - Direct DeepSeek API fallback
+
+    private func sendDirect(_ text: String) {
         history.append(ChatMessage(role: "user", content: text))
         play("look")
 
@@ -348,9 +722,10 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     // MARK: - Speech output (TTS)
 
     private func speak(_ text: String) {
-        guard speechEnabled else { return }
+        guard speechEnabled, !text.isEmpty else { return }
         synthesizer.stopSpeaking(at: .immediate)
-        let utterance = AVSpeechUtterance(string: text)
+        let clipped = text.count > 200 ? String(text.prefix(200)) + "……后面太长，人家就不念啦" : text
+        let utterance = AVSpeechUtterance(string: clipped)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
         utterance.rate = 0.52
         synthesizer.speak(utterance)
