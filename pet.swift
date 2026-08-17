@@ -42,21 +42,44 @@ struct ChatResponse: Decodable {
     let choices: [Choice]
 }
 
-/// Read DEEPSEEK_API_KEY from ~/.whalepet.conf (`KEY=value` lines), falling
-/// back to the process environment.
-func loadAPIKey() -> String? {
-    let path = NSHomeDirectory() + "/.whalepet.conf"
-    if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+/// Models routed through the local dsh ACP agent; anything else goes direct API.
+let acpModels = ["deepseek-v4-pro", "deepseek-v4-flash"]
+let apiModels = ["deepseek-chat", "deepseek-reasoner"]
+let defaultModel = "deepseek-v4-pro"
+
+private func confPath() -> String { NSHomeDirectory() + "/.whalepet.conf" }
+
+/// Parse ~/.whalepet.conf (`KEY=value` lines), overlaid on the process environment.
+func loadConf() -> [String: String] {
+    var conf: [String: String] = [:]
+    if let text = try? String(contentsOfFile: confPath(), encoding: .utf8) {
         for line in text.split(separator: "\n") {
             let parts = line.split(separator: "=", maxSplits: 1)
-            if parts.count == 2,
-               parts[0].trimmingCharacters(in: .whitespaces) == "DEEPSEEK_API_KEY" {
+            if parts.count == 2 {
                 let value = parts[1].trimmingCharacters(in: .whitespaces)
-                if !value.isEmpty { return value }
+                if !value.isEmpty {
+                    conf[parts[0].trimmingCharacters(in: .whitespaces)] = value
+                }
             }
         }
     }
-    return ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"]
+    if conf["DEEPSEEK_API_KEY"] == nil {
+        conf["DEEPSEEK_API_KEY"] = ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"]
+    }
+    return conf
+}
+
+/// Write ~/.whalepet.conf with owner-only permissions. Keeps only known keys.
+func saveConf(apiKey: String, model: String) {
+    var lines: [String] = []
+    if !apiKey.isEmpty { lines.append("DEEPSEEK_API_KEY=\(apiKey)") }
+    lines.append("WHALEPET_MODEL=\(model)")
+    try? (lines.joined(separator: "\n") + "\n").write(toFile: confPath(), atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: confPath())
+}
+
+func loadAPIKey() -> String? {
+    loadConf()["DEEPSEEK_API_KEY"]
 }
 
 // MARK: - Minimal ACP (Agent Client Protocol) client over stdio ndjson
@@ -204,6 +227,8 @@ final class PetView: NSImageView {
     var onClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onToggleChat: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
+    var onOpenWeb: (() -> Void)?
     private var downPoint = NSPoint.zero
     private var dragged = false
 
@@ -233,12 +258,18 @@ final class PetView: NSImageView {
         let menu = NSMenu()
         menu.addItem(withTitle: "对话", action: #selector(chatAction(_:)), keyEquivalent: "")
             .target = self
+        menu.addItem(withTitle: "设置…", action: #selector(settingsAction(_:)), keyEquivalent: "")
+            .target = self
+        menu.addItem(withTitle: "打开完整版（Web）", action: #selector(webAction(_:)), keyEquivalent: "")
+            .target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出鲸鱼娘", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.popUp(positioning: nil, at: event.locationInWindow, in: self)
     }
 
     @objc private func chatAction(_ sender: Any?) { onToggleChat?() }
+    @objc private func settingsAction(_ sender: Any?) { onOpenSettings?() }
+    @objc private func webAction(_ sender: Any?) { onOpenWeb?() }
 }
 
 /// Borderless bubble panel that can still become key for text input.
@@ -274,6 +305,14 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     private var acpPersonaSent = false
     private var queuedPrompt: String?
     private var currentReply = ""
+
+    // Settings
+    private var settingsPanel: BubblePanel?
+    private var keyField: NSSecureTextField?
+    private var modelPopup: NSPopUpButton?
+    private var settingsHint: NSTextField?
+    private var preferredModel: String = defaultModel
+    private var wantsAcp: Bool { acpModels.contains(preferredModel) }
 
     private let synthesizer = AVSpeechSynthesizer()
     private var speechEnabled = true
@@ -327,6 +366,10 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         view.onClick = { [weak self] in self?.toggleBubble() }
         view.onDoubleClick = { [weak self] in self?.play(clickActions.randomElement()!) }
         view.onToggleChat = { [weak self] in self?.toggleBubble() }
+        view.onOpenSettings = { [weak self] in self?.toggleSettings() }
+        view.onOpenWeb = { [weak self] in self?.openFullWeb() }
+
+        preferredModel = loadConf()["WHALEPET_MODEL"] ?? defaultModel
 
         buildBubble()
 
@@ -449,6 +492,163 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         }
     }
 
+    // MARK: - Settings panel
+
+    private func toggleSettings() {
+        if settingsPanel == nil { buildSettings() }
+        guard let panel = settingsPanel else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+            return
+        }
+        keyField?.stringValue = loadConf()["DEEPSEEK_API_KEY"] ?? ""
+        let all = acpModels + apiModels
+        modelPopup?.selectItem(at: all.firstIndex(of: preferredModel) ?? 0)
+        settingsHint?.stringValue = "保存后立即生效；切换模型或 key 会重启 dsh agent"
+        let pet = window.frame
+        panel.setFrameOrigin(NSPoint(x: pet.midX - panel.frame.width / 2, y: pet.maxY + 10))
+        panel.orderFrontRegardless()
+    }
+
+    private func buildSettings() {
+        let size = NSSize(width: 340, height: 190)
+        let panel = BubblePanel(contentRect: NSRect(origin: .zero, size: size),
+                                styleMask: [.borderless, .nonactivatingPanel],
+                                backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        effect.material = .popover
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 14
+        effect.layer?.masksToBounds = true
+        panel.contentView = effect
+
+        let keyLabel = NSTextField(labelWithString: "API Key：")
+        keyLabel.frame = NSRect(x: 12, y: 148, width: 72, height: 20)
+        effect.addSubview(keyLabel)
+
+        let keyField = NSSecureTextField(frame: NSRect(x: 84, y: 144, width: 244, height: 26))
+        keyField.placeholderString = "sk-..."
+        effect.addSubview(keyField)
+        self.keyField = keyField
+
+        let modelLabel = NSTextField(labelWithString: "模型：")
+        modelLabel.frame = NSRect(x: 12, y: 106, width: 72, height: 20)
+        effect.addSubview(modelLabel)
+
+        let popup = NSPopUpButton(frame: NSRect(x: 84, y: 102, width: 244, height: 28))
+        popup.addItems(withTitles: acpModels.map { $0 + "（dsh agent）" } + apiModels.map { $0 + "（纯聊天）" })
+        effect.addSubview(popup)
+        modelPopup = popup
+
+        let hint = NSTextField(labelWithString: "")
+        hint.frame = NSRect(x: 12, y: 66, width: 316, height: 28)
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.lineBreakMode = .byWordWrapping
+        hint.maximumNumberOfLines = 2
+        effect.addSubview(hint)
+        settingsHint = hint
+
+        let close = NSButton(frame: NSRect(x: 158, y: 16, width: 82, height: 32))
+        close.title = "关闭"
+        close.bezelStyle = .rounded
+        close.target = self
+        close.action = #selector(toggleSettingsAction)
+        effect.addSubview(close)
+
+        let save = NSButton(frame: NSRect(x: 246, y: 16, width: 82, height: 32))
+        save.title = "保存"
+        save.bezelStyle = .rounded
+        save.target = self
+        save.action = #selector(saveSettings)
+        effect.addSubview(save)
+
+        window.addChildWindow(panel, ordered: .above)
+        settingsPanel = panel
+    }
+
+    @objc private func toggleSettingsAction() { toggleSettings() }
+
+    @objc private func saveSettings() {
+        let key = (keyField?.stringValue ?? "").trimmingCharacters(in: .whitespaces)
+        let all = acpModels + apiModels
+        let index = max(0, min(modelPopup?.indexOfSelectedItem ?? 0, all.count - 1))
+        let model = all[index]
+        let conf = loadConf()
+        let changed = model != preferredModel || key != (conf["DEEPSEEK_API_KEY"] ?? "")
+        preferredModel = model
+        saveConf(apiKey: key, model: model)
+        settingsHint?.stringValue = "已保存 ✓"
+        if changed {
+            // key/model 都是 ACP 子进程启动时注入的，必须重启才能生效。
+            acp?.terminate()
+            acp = nil
+            acpSession = nil
+            acpStarting = false
+            acpFailed = false
+            acpPersonaSent = false
+            if wantsAcp { startAcpIfNeeded() }
+        }
+    }
+
+    // MARK: - Full web UI
+
+    /// Open the dsh web UI in the browser, booting `pnpm dsh web` first if the
+    /// port is not serving yet.
+    private func openFullWeb() {
+        let url = URL(string: "http://127.0.0.1:3080/")!
+        probeWeb(url) { [weak self] up in
+            if up {
+                NSWorkspace.shared.open(url)
+            } else {
+                self?.bootWebAndOpen(url, attempts: 0)
+            }
+        }
+    }
+
+    private func probeWeb(_ url: URL, done: @escaping (Bool) -> Void) {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 1.5)
+        request.httpMethod = "HEAD"
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            DispatchQueue.main.async {
+                done((response as? HTTPURLResponse)?.statusCode == 200)
+            }
+        }.resume()
+    }
+
+    private func bootWebAndOpen(_ url: URL, attempts: Int) {
+        if attempts == 0 {
+            statusLabel.stringValue = "正在启动 dsh web……"
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = ["-c", "cd \"\(dshRepo)\" && nohup \"\(nodeBin)/pnpm\" dsh web >/tmp/dsh-web.log 2>&1 &"]
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+            process.environment = env
+            try? process.run()
+        }
+        guard attempts < 90 else {
+            statusLabel.stringValue = "dsh web 启动超时，日志见 /tmp/dsh-web.log"
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.probeWeb(url) { up in
+                if up {
+                    self?.statusLabel.stringValue = ""
+                    NSWorkspace.shared.open(url)
+                } else {
+                    self?.bootWebAndOpen(url, attempts: attempts + 1)
+                }
+            }
+        }
+    }
+
     // MARK: - Animation
 
     private func framesFor(_ name: String) -> [NSImage] {
@@ -507,14 +707,16 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         input.stringValue = ""
         appendLine("你", text)
 
-        if acpFailed {
-            sendDirect(text)
-        } else if acpSession != nil {
-            sendAcp(text)
+        if wantsAcp && !acpFailed {
+            if acpSession != nil {
+                sendAcp(text)
+            } else {
+                queuedPrompt = text
+                statusLabel.stringValue = "dsh 还在启动，醒来自动发送……"
+                startAcpIfNeeded()
+            }
         } else {
-            queuedPrompt = text
-            statusLabel.stringValue = "dsh 还在启动，醒来自动发送……"
-            startAcpIfNeeded()
+            sendDirect(text)
         }
     }
 
@@ -552,6 +754,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
 
         var env = ProcessInfo.processInfo.environment
         env["DEEPSEEK_API_KEY"] = key
+        env["DSH_ACP_MODEL"] = preferredModel
         env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         env["HOME"] = NSHomeDirectory()
 
@@ -686,7 +889,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         request.httpMethod = "POST"
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body = ChatRequest(model: "deepseek-chat",
+        let body = ChatRequest(model: apiModels.contains(preferredModel) ? preferredModel : "deepseek-chat",
                                messages: [ChatMessage(role: "system", content: systemPrompt)] + history.suffix(12),
                                stream: false)
         request.httpBody = try? JSONEncoder().encode(body)

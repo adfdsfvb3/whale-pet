@@ -14,12 +14,15 @@
 - **语音朗读**：回复自动用中文语音读出来（超长回复只念前 200 字）
 - **双击**：随机卖萌（开心跃动 / 害羞 / 傲娇生气）
 - **随机小动作**：待机时每隔 25~60 秒随机表演（东张西望、哼歌、伸懒腰、玩魔方、螃蟹走路）
-- **右键菜单**：打开/关闭对话、退出
+- **右键菜单**：对话 / 设置 / 打开完整版（Web）/ 退出
+- **设置面板**：GUI 里直接配置 API key 和模型（`deepseek-v4-pro` / `deepseek-v4-flash` 走 dsh agent，`deepseek-chat` / `deepseek-reasoner` 纯聊天），保存即生效
+- **打开完整版**：一键跳到 dsh web 端（http://127.0.0.1:3080），服务没在跑会自动先启动再打开浏览器
 
 ### dsh agent 模式说明
 
 - 需要本机已 clone 并构建 deepseek-harness（路径在 `pet.swift` 的 `dshRepo` 常量，默认 `/Users/miao/deepseek-harness`，按需修改）
 - 首次打开对话框时自动拉起 ACP server 子进程（`node --import tsx packages/examples/acp-demo/src/bin.ts`），通过 stdin/stdout 上的 ndjson JSON-RPC 通信
+- 模型通过 `DSH_ACP_MODEL` 环境变量注入（需要在 dsh 仓库的 `examples/acp-agent/cordis.yml` 把 `model` 一行改为 `!!js "process.env.DSH_ACP_MODEL ?? 'deepseek-v4-pro'"`，本仓库假设已打此补丁）
 - **安全边界**：agent 的文件系统和命令执行被沙箱限制在 `~/whale-pet/workspace`；一次性权限请求自动允许（仅在该沙箱范围内）
 - 想让她操作别的目录，直接对话里说明即可——她会先复制/移动到 workspace 内处理
 - `WHALEPET_SELFTEST=1 open dist/WhalePet.app` 可无界面自测 ACP 链路（结果写 `/tmp/whalepet-selftest.log`）
@@ -37,14 +40,17 @@ open dist/WhalePet.app
 
 ## 配置 API key（必需）
 
-聊天功能需要你自己的 [DeepSeek API key](https://platform.deepseek.com/)：
+聊天功能需要你自己的 [DeepSeek API key](https://platform.deepseek.com/)，两种方式任选：
+
+- **推荐**：右键鲸鱼娘 → 设置…，在面板里粘贴 key、选模型，点保存
+- 手动：
 
 ```sh
 echo 'DEEPSEEK_API_KEY=sk-你的key' > ~/.whalepet.conf
 chmod 600 ~/.whalepet.conf
 ```
 
-程序在**运行时**读取 `~/.whalepet.conf` 或环境变量 `DEEPSEEK_API_KEY`，key 不会写入代码或 app 包。**请勿把这个文件提交进仓库**（`.gitignore` 已排除 `*.conf`）。
+配置文件 `~/.whalepet.conf` 同时保存 `WHALEPET_MODEL`（模型选择）。程序在**运行时**读取该文件或环境变量，key 不会写入代码或 app 包。**请勿把这个文件提交进仓库**（`.gitignore` 已排除 `*.conf`）。
 
 ## 系统权限
 
