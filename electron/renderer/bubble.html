@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="header">
+    <span class="title">🐳 鲸鱼娘</span>
+    <button id="btn-new" title="新对话">新对话</button>
+    <button id="btn-settings" title="设置">⚙</button>
+    <button id="btn-close" title="关闭">✕</button>
+  </div>
+
+  <div id="transcript"></div>
+  <div id="status"></div>
+
+  <div id="input-row">
+    <input id="input" type="text" placeholder="和鲸鱼娘说点什么……" autocomplete="off">
+    <button id="btn-mic" title="语音输入">🎤</button>
+    <button id="btn-send" title="发送">➤</button>
+  </div>
+
+  <div id="settings">
+    <label>DeepSeek API Key
+      <input id="set-key" type="password" placeholder="sk-……" autocomplete="off">
+    </label>
+    <label>模型
+      <select id="set-model">
+        <option value="deepseek-v4-pro">deepseek-v4-pro（dsh agent，带工具）</option>
+        <option value="deepseek-v4-flash">deepseek-v4-flash（dsh agent，带工具）</option>
+        <option value="deepseek-chat">deepseek-chat（直连 API）</option>
+        <option value="deepseek-reasoner">deepseek-reasoner（直连 API）</option>
+      </select>
+    </label>
+    <div class="row">
+      <input id="set-tts" type="checkbox">
+      <label for="set-tts" style="flex-direction:row">回复语音朗读（TTS）</label>
+    </div>
+    <label>dsh 仓库路径（agent 模式用）
+      <input id="set-repo" type="text" placeholder="/path/to/deepseek-harness">
+    </label>
+    <button id="btn-save">保存</button>
+    <div class="hint">API Key 只保存在本机设置文件里。v4 模型走本地 dsh agent（有文件/命令行工具能力）；chat/reasoner 直连 DeepSeek API。</div>
+  </div>
+
+<script src="bubble.js"></script>
+</body>
+</html>

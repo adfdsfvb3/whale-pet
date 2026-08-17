@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  /* 宠物窗：无边框透明窗口，整窗就是宠物本体 */
+  html, body { margin: 0; padding: 0; width: 220px; height: 220px; overflow: hidden; background: transparent; }
+  img { width: 220px; height: 220px; display: block; -webkit-user-drag: none; user-select: none; cursor: grab; }
+  img:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<img id="pet" src="../frames/idle/000.png" alt="鲸鱼娘">
+<script src="pet.js"></script>
+</body>
+</html>

@@ -3,3 +3,9 @@ build/
 dist/
 .DS_Store
 *.conf
+
+# Electron 桌宠：帧序列由构建脚本生成，依赖与打包产物不入库
+!electron/build/
+electron/frames/
+electron/node_modules/
+electron/dist-electron/
