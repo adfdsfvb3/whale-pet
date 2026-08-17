@@ -60,6 +60,19 @@ let petSizeOptions: [(title: String, size: CGFloat)] = [
     ("大（300px）", 300),
 ]
 
+/// Curated dsh web-profile plugins offered for one-click install.
+let knownPlugins: [(pkg: String, desc: String)] = [
+    ("@linxin666/dsh-web-ui-all", "全家桶聚合"),
+    ("dsh-pet", "网页版鲸鱼娘宠物"),
+    ("@linxin666/dsh-client-ui-task-board", "任务看板"),
+    ("@linxin666/dsh-client-ui-git-graph", "Git 分支图"),
+    ("@linxin666/dsh-live-stats", "实时 token 统计"),
+    ("@linxin666/dsh-ssh", "SSH 远程操作"),
+    ("@linxin666/dsh-remote-web-ui", "手机遥控"),
+    ("@linxin666/dsh-skins", "皮肤全家桶"),
+    ("@linxin666/dsh-client-ui-aionui-panel", "右侧面板系统"),
+]
+
 private func confPath() -> String { NSHomeDirectory() + "/.whalepet.conf" }
 
 /// Parse ~/.whalepet.conf (`KEY=value` lines), overlaid on the process environment.
@@ -243,6 +256,7 @@ final class PetView: NSImageView {
     var onDoubleClick: (() -> Void)?
     var onToggleChat: (() -> Void)?
     var onOpenSettings: (() -> Void)?
+    var onOpenPlugins: (() -> Void)?
     var onOpenWeb: (() -> Void)?
     private var downPoint = NSPoint.zero
     private var dragged = false
@@ -275,6 +289,8 @@ final class PetView: NSImageView {
             .target = self
         menu.addItem(withTitle: "设置…", action: #selector(settingsAction(_:)), keyEquivalent: "")
             .target = self
+        menu.addItem(withTitle: "插件…", action: #selector(pluginsAction(_:)), keyEquivalent: "")
+            .target = self
         menu.addItem(withTitle: "打开完整版（Web）", action: #selector(webAction(_:)), keyEquivalent: "")
             .target = self
         menu.addItem(.separator())
@@ -284,6 +300,7 @@ final class PetView: NSImageView {
 
     @objc private func chatAction(_ sender: Any?) { onToggleChat?() }
     @objc private func settingsAction(_ sender: Any?) { onOpenSettings?() }
+    @objc private func pluginsAction(_ sender: Any?) { onOpenPlugins?() }
     @objc private func webAction(_ sender: Any?) { onOpenWeb?() }
 }
 
@@ -336,6 +353,14 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     private var ambientIndex = 2  // 正常
     private var wantsAcp: Bool { acpModels.contains(preferredModel) }
     private var launchAgentPath: String { NSHomeDirectory() + "/Library/LaunchAgents/local.whalepet.plist" }
+
+    // Plugins
+    private var pluginsPanel: BubblePanel?
+    private var pluginLogView: NSTextView?
+    private var pluginButtons: [String: NSButton] = [:]
+    private var customPluginField: NSTextField?
+    private var installRunning = false
+    private var webProfileDir: String { NSHomeDirectory() + "/.dsh/profiles/web" }
 
     private let synthesizer = AVSpeechSynthesizer()
     private var speechEnabled = true
@@ -391,6 +416,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         view.onDoubleClick = { [weak self] in self?.play(clickActions.randomElement()!) }
         view.onToggleChat = { [weak self] in self?.toggleBubble() }
         view.onOpenSettings = { [weak self] in self?.toggleSettings() }
+        view.onOpenPlugins = { [weak self] in self?.togglePlugins() }
         view.onOpenWeb = { [weak self] in self?.openFullWeb() }
 
         let conf = loadConf()
@@ -732,6 +758,211 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         try? process.run()
     }
 
+    // MARK: - dsh plugins panel
+
+    private func togglePlugins() {
+        if pluginsPanel == nil { buildPlugins() }
+        guard let panel = pluginsPanel else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+            return
+        }
+        refreshPluginStates()
+        let pet = window.frame
+        panel.setFrameOrigin(NSPoint(x: pet.midX - panel.frame.width / 2, y: pet.maxY + 10))
+        panel.orderFrontRegardless()
+    }
+
+    private func buildPlugins() {
+        let size = NSSize(width: 340, height: 380)
+        let panel = BubblePanel(contentRect: NSRect(origin: .zero, size: size),
+                                styleMask: [.borderless, .nonactivatingPanel],
+                                backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+
+        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        effect.material = .popover
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 14
+        effect.layer?.masksToBounds = true
+        panel.contentView = effect
+
+        let title = NSTextField(labelWithString: "dsh 插件（web 端）")
+        title.frame = NSRect(x: 12, y: 348, width: 240, height: 20)
+        title.font = NSFont.boldSystemFont(ofSize: 13)
+        effect.addSubview(title)
+
+        let rowHeight: CGFloat = 26
+        let docView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: rowHeight * CGFloat(knownPlugins.count)))
+        for (i, plugin) in knownPlugins.enumerated() {
+            let y = rowHeight * CGFloat(knownPlugins.count - 1 - i)
+            let label = NSTextField(labelWithString: "\(plugin.desc)  \(plugin.pkg)")
+            label.frame = NSRect(x: 4, y: y + 3, width: 218, height: 20)
+            label.font = NSFont.systemFont(ofSize: 10)
+            label.textColor = .secondaryLabelColor
+            label.lineBreakMode = .byTruncatingMiddle
+            docView.addSubview(label)
+
+            let button = NSButton(frame: NSRect(x: 226, y: y + 1, width: 88, height: 24))
+            button.title = "安装"
+            button.bezelStyle = .rounded
+            button.font = NSFont.systemFont(ofSize: 11)
+            button.target = self
+            button.action = #selector(installKnownAction(_:))
+            button.identifier = NSUserInterfaceItemIdentifier(plugin.pkg)
+            docView.addSubview(button)
+            pluginButtons[plugin.pkg] = button
+        }
+        let scroll = NSScrollView(frame: NSRect(x: 10, y: 100, width: 320, height: 240))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.documentView = docView
+        effect.addSubview(scroll)
+
+        let custom = NSTextField(frame: NSRect(x: 10, y: 66, width: 208, height: 26))
+        custom.placeholderString = "任意 npm 包名，如 dsh-pet@0.1.2"
+        effect.addSubview(custom)
+        customPluginField = custom
+
+        let installCustom = NSButton(frame: NSRect(x: 222, y: 64, width: 52, height: 28))
+        installCustom.title = "安装"
+        installCustom.bezelStyle = .rounded
+        installCustom.target = self
+        installCustom.action = #selector(installCustomAction)
+        effect.addSubview(installCustom)
+
+        let restart = NSButton(frame: NSRect(x: 278, y: 64, width: 52, height: 28))
+        restart.title = "重启web"
+        restart.bezelStyle = .rounded
+        restart.target = self
+        restart.action = #selector(restartWebAction)
+        effect.addSubview(restart)
+
+        let logScroll = NSScrollView(frame: NSRect(x: 10, y: 8, width: 320, height: 50))
+        logScroll.hasVerticalScroller = true
+        logScroll.borderType = .noBorder
+        logScroll.drawsBackground = false
+        let logView = NSTextView(frame: logScroll.bounds)
+        logView.isEditable = false
+        logView.drawsBackground = false
+        logView.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        logView.textContainer?.widthTracksTextView = true
+        logScroll.documentView = logView
+        effect.addSubview(logScroll)
+        pluginLogView = logView
+
+        window.addChildWindow(panel, ordered: .above)
+        pluginsPanel = panel
+    }
+
+    private func pluginLog(_ text: String) {
+        guard !text.isEmpty else { return }
+        pluginLogView?.textStorage?.append(NSAttributedString(string: text + "\n"))
+        pluginLogView?.scrollToEndOfDocument(nil)
+    }
+
+    private func refreshPluginStates() {
+        let path = webProfileDir + "/package.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let deps = json["dependencies"] as? [String: Any] else { return }
+        for (pkg, _) in knownPlugins {
+            let installed = deps[pkg] != nil
+            let button = pluginButtons[pkg]
+            button?.title = installed ? "已安装" : "安装"
+            button?.isEnabled = !installed
+        }
+    }
+
+    @objc private func installKnownAction(_ sender: NSButton) {
+        guard let pkg = sender.identifier?.rawValue else { return }
+        installPlugin(pkg, attempt: 0)
+    }
+
+    @objc private func installCustomAction() {
+        let pkg = (customPluginField?.stringValue ?? "").trimmingCharacters(in: .whitespaces)
+        guard !pkg.isEmpty else { return }
+        installPlugin(pkg, attempt: 0)
+    }
+
+    @objc private func restartWebAction() {
+        pluginLog("→ 重启 dsh web……")
+        runQuiet("/usr/bin/pkill", ["-f", "apps/cli/src/bin.ts web"])
+        let url = URL(string: "http://127.0.0.1:3080/")!
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.bootWeb(url, attempts: 0, openWhenUp: false)
+        }
+    }
+
+    /// Runs `pnpm dsh plugin --profile web add <pkg>`. pnpm 11 blocks
+    /// dependency build scripts by default; the CLI records undecided
+    /// packages as `allowBuilds` placeholders in the profile's
+    /// pnpm-workspace.yaml, so a failed first attempt is retried once after
+    /// approving the placeholders.
+    private func installPlugin(_ pkg: String, attempt: Int) {
+        guard !installRunning else {
+            pluginLog("已有安装任务在进行，等它结束再装")
+            return
+        }
+        installRunning = true
+        pluginLog("→ pnpm dsh plugin --profile web add \(pkg)")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: nodeBin + "/pnpm")
+        process.arguments = ["dsh", "plugin", "--profile", "web", "add", pkg]
+        process.currentDirectoryURL = URL(fileURLWithPath: dshRepo)
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        env["HOME"] = NSHomeDirectory()
+        process.environment = env
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
+            DispatchQueue.main.async { self?.pluginLog(text) }
+        }
+        process.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.installRunning = false
+                if proc.terminationStatus == 0 {
+                    self.pluginLog("✓ 安装完成：\(pkg)（若 web 在运行，点「重启web」生效）")
+                    self.refreshPluginStates()
+                } else if attempt == 0, self.approvePendingBuilds() {
+                    self.pluginLog("…已批准依赖构建脚本，重试安装")
+                    self.installPlugin(pkg, attempt: 1)
+                } else {
+                    self.pluginLog("✗ 安装失败（退出码 \(proc.terminationStatus)）")
+                }
+            }
+        }
+        do {
+            try process.run()
+        } catch {
+            installRunning = false
+            pluginLog("✗ 无法启动 pnpm：\(error.localizedDescription)")
+        }
+    }
+
+    /// Approves `allowBuilds` placeholders the dsh CLI left undecided.
+    /// Returns true when something changed and a retry is worthwhile.
+    @discardableResult
+    private func approvePendingBuilds() -> Bool {
+        let path = webProfileDir + "/pnpm-workspace.yaml"
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+              text.contains("set this to true or false") else { return false }
+        let approved = text.replacingOccurrences(of: "set this to true or false", with: "true")
+        try? approved.write(toFile: path, atomically: true, encoding: .utf8)
+        return true
+    }
+
     // MARK: - Full web UI
 
     /// Open the dsh web UI in the browser, booting `pnpm dsh web` first if the
@@ -742,7 +973,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             if up {
                 NSWorkspace.shared.open(url)
             } else {
-                self?.bootWebAndOpen(url, attempts: 0)
+                self?.bootWeb(url, attempts: 0, openWhenUp: true)
             }
         }
     }
@@ -757,7 +988,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         }.resume()
     }
 
-    private func bootWebAndOpen(_ url: URL, attempts: Int) {
+    private func bootWeb(_ url: URL, attempts: Int, openWhenUp: Bool) {
         if attempts == 0 {
             statusLabel.stringValue = "正在启动 dsh web……"
             let process = Process()
@@ -770,15 +1001,20 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         }
         guard attempts < 90 else {
             statusLabel.stringValue = "dsh web 启动超时，日志见 /tmp/dsh-web.log"
+            pluginLog("✗ dsh web 启动超时，日志见 /tmp/dsh-web.log")
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.probeWeb(url) { up in
                 if up {
                     self?.statusLabel.stringValue = ""
-                    NSWorkspace.shared.open(url)
+                    if openWhenUp {
+                        NSWorkspace.shared.open(url)
+                    } else {
+                        self?.pluginLog("✓ dsh web 已重启：http://127.0.0.1:3080")
+                    }
                 } else {
-                    self?.bootWebAndOpen(url, attempts: attempts + 1)
+                    self?.bootWeb(url, attempts: attempts + 1, openWhenUp: openWhenUp)
                 }
             }
         }
