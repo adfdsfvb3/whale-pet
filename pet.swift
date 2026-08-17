@@ -501,6 +501,16 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     private var replyStartLocation = 0
     private let bubbleSmall = NSSize(width: 340, height: 380)
 
+    // 历史对话归档 & 长时记忆
+    private var conversationId: String?
+    private var conversationMessages: [[String: String]] = []  // [{role, text}]
+    private var resumeContext: String?
+    private var userTurnsSinceDistill = 0
+    private var distillRunning = false
+    private var historyView: NSView?
+    private var historyDir: String { NSHomeDirectory() + "/whale-pet/history" }
+    private var memoryPath: String { NSHomeDirectory() + "/whale-pet/memory.md" }
+
     // Wandering
     private var walkTimer: Timer?
     private var walkTarget = NSPoint.zero
@@ -648,6 +658,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        persistConversation()
         acpIntentionalStop = true
         acp?.terminate()
     }
@@ -710,6 +721,15 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.autoresizingMask = [.width, .maxYMargin]
         effect.addSubview(statusLabel)
+
+        let historyBtn = NSButton(frame: NSRect(x: bubbleSmall.width - 142, y: 56, width: 62, height: 22))
+        historyBtn.title = "历史"
+        historyBtn.bezelStyle = .rounded
+        historyBtn.font = NSFont.systemFont(ofSize: 10)
+        historyBtn.target = self
+        historyBtn.action = #selector(toggleHistoryView)
+        historyBtn.autoresizingMask = [.minXMargin, .maxYMargin]
+        effect.addSubview(historyBtn)
 
         let newChat = NSButton(frame: NSRect(x: bubbleSmall.width - 74, y: 56, width: 62, height: 22))
         newChat.title = "新对话"
@@ -776,7 +796,147 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
 
     @objc private func closeBubbleAction() { toggleBubble() }
 
+    // MARK: - 历史对话面板
+
+    @objc private func toggleHistoryView() {
+        if historyView == nil { buildHistoryView() }
+        guard let hv = historyView else { return }
+        if hv.isHidden {
+            refreshHistory()
+            hv.isHidden = false
+        } else {
+            hv.isHidden = true
+        }
+    }
+
+    private func buildHistoryView() {
+        guard let effect = bubble.contentView, let scroll = transcript.enclosingScrollView else { return }
+        let hv = NSView(frame: scroll.frame)
+        hv.autoresizingMask = [.width, .height]
+        hv.wantsLayer = true
+        hv.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        hv.layer?.cornerRadius = 8
+
+        let list = NSScrollView(frame: NSRect(x: 0, y: 36, width: hv.frame.width, height: hv.frame.height - 36))
+        list.autoresizingMask = [.width, .height]
+        list.hasVerticalScroller = true
+        list.drawsBackground = false
+        list.borderType = .noBorder
+        list.identifier = NSUserInterfaceItemIdentifier("historyList")
+        hv.addSubview(list)
+
+        let back = NSButton(frame: NSRect(x: 8, y: 6, width: 60, height: 24))
+        back.title = "返回"
+        back.bezelStyle = .rounded
+        back.target = self
+        back.action = #selector(toggleHistoryView)
+        back.autoresizingMask = [.maxXMargin, .maxYMargin]
+        hv.addSubview(back)
+
+        effect.addSubview(hv)
+        hv.isHidden = true
+        historyView = hv
+    }
+
+    private func refreshHistory() {
+        guard let hv = historyView,
+              let list = hv.subviews.first(where: { $0.identifier?.rawValue == "historyList" }) as? NSScrollView
+        else { return }
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: historyDir))?
+            .filter { $0.hasSuffix(".json") }.sorted(by: >) ?? []
+        let rowHeight: CGFloat = 42
+        let width = max(list.frame.width, 280)
+        let doc = NSView(frame: NSRect(x: 0, y: 0,
+                                       width: width,
+                                       height: max(rowHeight * CGFloat(max(files.count, 1)), list.frame.height)))
+        if files.isEmpty {
+            let empty = NSTextField(labelWithString: "还没有历史对话")
+            empty.frame = NSRect(x: 12, y: doc.frame.height - 30, width: 200, height: 20)
+            empty.textColor = .secondaryLabelColor
+            doc.addSubview(empty)
+        }
+        let parser = DateFormatter()
+        parser.dateFormat = "yyyyMMdd-HHmmss"
+        let display = DateFormatter()
+        display.dateFormat = "MM-dd HH:mm"
+        for (i, file) in files.enumerated() {
+            let y = doc.frame.height - rowHeight * CGFloat(i + 1)
+            let id = String(file.dropLast(5))
+            var title = id
+            var snippet = ""
+            if let data = FileManager.default.contents(atPath: historyDir + "/" + file),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let messages = json["messages"] as? [[String: String]] {
+                snippet = messages.first(where: { $0["role"] == "user" })?["text"] ?? ""
+                if let date = parser.date(from: String(id.prefix(15))) {
+                    title = display.string(from: date) + "（\(messages.count) 条）"
+                }
+            }
+            let label = NSTextField(labelWithString: title + "  " + String(snippet.prefix(24)))
+            label.frame = NSRect(x: 8, y: y + 11, width: width - 150, height: 20)
+            label.font = NSFont.systemFont(ofSize: 11)
+            label.lineBreakMode = .byTruncatingTail
+            doc.addSubview(label)
+
+            let resume = NSButton(frame: NSRect(x: width - 132, y: y + 9, width: 58, height: 24))
+            resume.title = "继续"
+            resume.bezelStyle = .rounded
+            resume.font = NSFont.systemFont(ofSize: 11)
+            resume.target = self
+            resume.action = #selector(resumeHistoryAction(_:))
+            resume.identifier = NSUserInterfaceItemIdentifier(id)
+            doc.addSubview(resume)
+
+            let del = NSButton(frame: NSRect(x: width - 68, y: y + 9, width: 58, height: 24))
+            del.title = "删除"
+            del.bezelStyle = .rounded
+            del.font = NSFont.systemFont(ofSize: 11)
+            del.target = self
+            del.action = #selector(deleteHistoryAction(_:))
+            del.identifier = NSUserInterfaceItemIdentifier(id)
+            doc.addSubview(del)
+        }
+        list.documentView = doc
+    }
+
+    @objc private func resumeHistoryAction(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue,
+              let data = FileManager.default.contents(atPath: historyDir + "/" + id + ".json"),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messages = json["messages"] as? [[String: String]] else { return }
+        archiveConversation()  // 当前会话先归档，再载入旧会话
+        transcript.textStorage?.setAttributedString(NSAttributedString())
+        for message in messages {
+            appendLine(message["role"] == "user" ? "你" : "鲸鱼娘", message["text"] ?? "")
+        }
+        conversationMessages = messages
+        conversationId = id
+        // 直连模式可以完整恢复上下文；ACP 只能开新会话 + 注入旧记录摘要。
+        history = messages.map {
+            ChatMessage(role: $0["role"] == "user" ? "user" : "assistant", content: $0["text"] ?? "")
+        }
+        acpPersonaSent = false
+        if acpSession != nil {
+            acpSession = nil
+            if let acp { client_newSession(acp) }
+        }
+        var context = messages.suffix(10)
+            .map { "\($0["role"] == "user" ? "主人" : "鲸鱼娘")：\($0["text"] ?? "")" }
+            .joined(separator: "\n")
+        if context.count > 4000 { context = String(context.suffix(4000)) }
+        resumeContext = context
+        historyView?.isHidden = true
+        statusLabel.stringValue = "已载入历史对话，接着说就行"
+    }
+
+    @objc private func deleteHistoryAction(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        try? FileManager.default.removeItem(atPath: historyDir + "/" + id + ".json")
+        refreshHistory()
+    }
+
     @objc private func startNewChat() {
+        archiveConversation()
         transcript.textStorage?.setAttributedString(NSAttributedString())
         history = []
         currentReply = ""
@@ -1441,6 +1601,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         guard !text.isEmpty else { return }
         input.stringValue = ""
         appendLine("你", text)
+        recordMessage("user", text)
 
         if wantsAcp && !acpFailed {
             if acpSession != nil {
@@ -1594,8 +1755,13 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
 
         var prompt = text
         if !acpPersonaSent {
-            prompt = acpPersonaPrefix + "\n\n" + text
+            prompt = acpPersonaPrefix + memorySnippet() + "\n\n" + text
             acpPersonaSent = true
+        }
+        // 从历史会话继续时，把旧对话摘要注入第一条 prompt。
+        if let resume = resumeContext {
+            prompt = "【之前的对话记录，供你回忆上下文】\n\(resume)\n\n【主人现在说】\n\(prompt)"
+            resumeContext = nil
         }
         replyStartLocation = transcript.textStorage?.length ?? 0
         appendRaw("鲸鱼娘：")
@@ -1613,6 +1779,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
                     exit(0)
                 }
                 self.finalizeReply()
+                self.recordMessage("assistant", self.currentReply)
                 self.speak(self.currentReply)
                 self.play("happy")
             case .failure(let error):
@@ -1635,6 +1802,95 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         let range = NSRange(location: replyStartLocation, length: storage.length - replyStartLocation)
         storage.replaceCharacters(in: range, with: rendered)
         transcript.scrollToEndOfDocument(nil)
+    }
+
+    // MARK: - 历史对话归档
+
+    /// 记录一条消息并落盘当前会话（每轮都写，崩溃也不丢）。
+    private func recordMessage(_ role: String, _ text: String) {
+        guard !text.isEmpty else { return }
+        conversationMessages.append(["role": role, "text": text])
+        persistConversation()
+        if role == "user" {
+            userTurnsSinceDistill += 1
+            if userTurnsSinceDistill >= 3 { distillMemory() }
+        }
+    }
+
+    private func persistConversation() {
+        guard !conversationMessages.isEmpty else { return }
+        if conversationId == nil {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            conversationId = formatter.string(from: Date()) + "-" + String(Int.random(in: 100...999))
+        }
+        try? FileManager.default.createDirectory(atPath: historyDir, withIntermediateDirectories: true)
+        let payload: [String: Any] = [
+            "id": conversationId!,
+            "startedAt": Date().timeIntervalSince1970,
+            "model": preferredModel,
+            "messages": conversationMessages,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted) {
+            try? data.write(to: URL(fileURLWithPath: historyDir + "/" + conversationId! + ".json"))
+        }
+    }
+
+    private func archiveConversation() {
+        persistConversation()
+        conversationMessages = []
+        conversationId = nil
+        resumeContext = nil
+    }
+
+    // MARK: - 长时记忆
+
+    /// 注入到 system/人设的记忆片段；没有记忆时为空串。
+    private func memorySnippet() -> String {
+        guard let text = try? String(contentsOfFile: memoryPath, encoding: .utf8),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
+        return "\n\n你记得的关于主人的长期记忆：\n" + text
+    }
+
+    /// 每 3 个用户回合触发一次：用直连 API 把近期对话蒸馏合并进 memory.md。
+    /// 静默失败（下次再说），不打断聊天。
+    private func distillMemory() {
+        guard !distillRunning, let key = loadAPIKey() else { return }
+        let recent = conversationMessages.suffix(12)
+        guard recent.contains(where: { $0["role"] == "user" }) else { return }
+        distillRunning = true
+        userTurnsSinceDistill = 0
+
+        let existing = (try? String(contentsOfFile: memoryPath, encoding: .utf8)) ?? "（空）"
+        let dialog = recent.map { "\($0["role"] == "user" ? "主人" : "鲸鱼娘")：\($0["text"] ?? "")" }.joined(separator: "\n")
+        let prompt = """
+        你在维护一份关于用户的长期记忆。从下面的新对话中提取值得长期记住的事实（偏好、习惯、正在做的事、重要决定、个人信息），与现有记忆合并、去重、删掉过时的，输出精简的中文 markdown 列表（最多 30 条，每条一行，只要列表不要任何解释）。没有值得记的就不改原文返回。
+
+        【现有记忆】
+        \(existing)
+
+        【新对话】
+        \(dialog)
+        """
+
+        var request = URLRequest(url: URL(string: "https://api.deepseek.com/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = ChatRequest(model: "deepseek-chat",
+                               messages: [ChatMessage(role: "user", content: prompt)],
+                               stream: false)
+        request.httpBody = try? JSONEncoder().encode(body)
+        request.timeoutInterval = 60
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            defer { self?.distillRunning = false }
+            guard let data,
+                  let parsed = try? JSONDecoder().decode(ChatResponse.self, from: data),
+                  let memory = parsed.choices.first?.message.content,
+                  memory.count < 4000 else { return }
+            try? memory.write(toFile: self?.memoryPath ?? "", atomically: true, encoding: .utf8)
+        }.resume()
     }
 
     private func handleAcpEvent(_ message: [String: Any]) {
@@ -1680,7 +1936,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body = ChatRequest(model: apiModels.contains(preferredModel) ? preferredModel : "deepseek-chat",
-                               messages: [ChatMessage(role: "system", content: systemPrompt)] + history.suffix(12),
+                               messages: [ChatMessage(role: "system", content: systemPrompt + memorySnippet())] + history.suffix(12),
                                stream: false)
         request.httpBody = try? JSONEncoder().encode(body)
         request.timeoutInterval = 60
@@ -1714,6 +1970,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         statusLabel.stringValue = ""
         history.append(ChatMessage(role: "assistant", content: reply))
         appendLine("鲸鱼娘", reply)
+        recordMessage("assistant", reply)
         play("happy")
         speak(reply)
     }
