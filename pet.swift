@@ -47,6 +47,19 @@ let acpModels = ["deepseek-v4-pro", "deepseek-v4-flash"]
 let apiModels = ["deepseek-chat", "deepseek-reasoner"]
 let defaultModel = "deepseek-v4-pro"
 
+/// Ambient idle-action cadence presets; nil disables them.
+let ambientOptions: [(title: String, range: ClosedRange<Double>?)] = [
+    ("关闭", nil),
+    ("偶尔", 60...120),
+    ("正常", 25...60),
+    ("频繁", 10...25),
+]
+let petSizeOptions: [(title: String, size: CGFloat)] = [
+    ("小（160px）", 160),
+    ("中（220px）", 220),
+    ("大（300px）", 300),
+]
+
 private func confPath() -> String { NSHomeDirectory() + "/.whalepet.conf" }
 
 /// Parse ~/.whalepet.conf (`KEY=value` lines), overlaid on the process environment.
@@ -70,10 +83,12 @@ func loadConf() -> [String: String] {
 }
 
 /// Write ~/.whalepet.conf with owner-only permissions. Keeps only known keys.
-func saveConf(apiKey: String, model: String) {
-    var lines: [String] = []
-    if !apiKey.isEmpty { lines.append("DEEPSEEK_API_KEY=\(apiKey)") }
-    lines.append("WHALEPET_MODEL=\(model)")
+func saveConf(_ conf: [String: String]) {
+    let order = ["DEEPSEEK_API_KEY", "WHALEPET_MODEL", "WHALEPET_TTS", "WHALEPET_TTS_RATE", "WHALEPET_SIZE", "WHALEPET_AMBIENT"]
+    let lines = order.compactMap { key -> String? in
+        guard let value = conf[key], !value.isEmpty else { return nil }
+        return "\(key)=\(value)"
+    }
     try? (lines.joined(separator: "\n") + "\n").write(toFile: confPath(), atomically: true, encoding: .utf8)
     try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: confPath())
 }
@@ -311,11 +326,20 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     private var keyField: NSSecureTextField?
     private var modelPopup: NSPopUpButton?
     private var settingsHint: NSTextField?
+    private var ttsCheckbox: NSButton?
+    private var ttsRateSlider: NSSlider?
+    private var sizePopup: NSPopUpButton?
+    private var ambientPopup: NSPopUpButton?
+    private var loginCheckbox: NSButton?
     private var preferredModel: String = defaultModel
+    private var currentPetSize: CGFloat = petSize
+    private var ambientIndex = 2  // 正常
     private var wantsAcp: Bool { acpModels.contains(preferredModel) }
+    private var launchAgentPath: String { NSHomeDirectory() + "/Library/LaunchAgents/local.whalepet.plist" }
 
     private let synthesizer = AVSpeechSynthesizer()
     private var speechEnabled = true
+    private var synthesizerRate: Float = 0.52
 
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
     private let audioEngine = AVAudioEngine()
@@ -369,7 +393,18 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         view.onOpenSettings = { [weak self] in self?.toggleSettings() }
         view.onOpenWeb = { [weak self] in self?.openFullWeb() }
 
-        preferredModel = loadConf()["WHALEPET_MODEL"] ?? defaultModel
+        let conf = loadConf()
+        preferredModel = conf["WHALEPET_MODEL"] ?? defaultModel
+        speechEnabled = conf["WHALEPET_TTS"] != "0"
+        synthesizerRate = Double(conf["WHALEPET_TTS_RATE"] ?? "").map { Float($0) } ?? 0.52
+        if let size = Double(conf["WHALEPET_SIZE"] ?? ""), petSizeOptions.contains(where: { $0.size == CGFloat(size) }) {
+            currentPetSize = CGFloat(size)
+            window.setContentSize(NSSize(width: currentPetSize, height: currentPetSize))
+            view.frame = NSRect(origin: .zero, size: NSSize(width: currentPetSize, height: currentPetSize))
+        }
+        if let ambient = Int(conf["WHALEPET_AMBIENT"] ?? ""), ambientOptions.indices.contains(ambient) {
+            ambientIndex = ambient
+        }
 
         buildBubble()
 
@@ -501,9 +536,14 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             panel.orderOut(nil)
             return
         }
-        keyField?.stringValue = loadConf()["DEEPSEEK_API_KEY"] ?? ""
         let all = acpModels + apiModels
+        keyField?.stringValue = loadConf()["DEEPSEEK_API_KEY"] ?? ""
         modelPopup?.selectItem(at: all.firstIndex(of: preferredModel) ?? 0)
+        ttsCheckbox?.state = speechEnabled ? .on : .off
+        ttsRateSlider?.floatValue = synthesizerRate
+        sizePopup?.selectItem(at: petSizeOptions.firstIndex(where: { $0.size == currentPetSize }) ?? 1)
+        ambientPopup?.selectItem(at: ambientIndex)
+        loginCheckbox?.state = FileManager.default.fileExists(atPath: launchAgentPath) ? .on : .off
         settingsHint?.stringValue = "保存后立即生效；切换模型或 key 会重启 dsh agent"
         let pet = window.frame
         panel.setFrameOrigin(NSPoint(x: pet.midX - panel.frame.width / 2, y: pet.maxY + 10))
@@ -511,7 +551,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
     }
 
     private func buildSettings() {
-        let size = NSSize(width: 340, height: 190)
+        let size = NSSize(width: 340, height: 350)
         let panel = BubblePanel(contentRect: NSRect(origin: .zero, size: size),
                                 styleMask: [.borderless, .nonactivatingPanel],
                                 backing: .buffered, defer: false)
@@ -528,26 +568,56 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         effect.layer?.masksToBounds = true
         panel.contentView = effect
 
-        let keyLabel = NSTextField(labelWithString: "API Key：")
-        keyLabel.frame = NSRect(x: 12, y: 148, width: 72, height: 20)
-        effect.addSubview(keyLabel)
+        func label(_ text: String, _ y: CGFloat) {
+            let l = NSTextField(labelWithString: text)
+            l.frame = NSRect(x: 12, y: y + 2, width: 88, height: 20)
+            effect.addSubview(l)
+        }
 
-        let keyField = NSSecureTextField(frame: NSRect(x: 84, y: 144, width: 244, height: 26))
+        label("API Key：", 306)
+        let keyField = NSSecureTextField(frame: NSRect(x: 100, y: 304, width: 228, height: 26))
         keyField.placeholderString = "sk-..."
         effect.addSubview(keyField)
         self.keyField = keyField
 
-        let modelLabel = NSTextField(labelWithString: "模型：")
-        modelLabel.frame = NSRect(x: 12, y: 106, width: 72, height: 20)
-        effect.addSubview(modelLabel)
+        label("模型：", 266)
+        let modelPopup = NSPopUpButton(frame: NSRect(x: 100, y: 262, width: 228, height: 28))
+        modelPopup.addItems(withTitles: acpModels.map { $0 + "（dsh agent）" } + apiModels.map { $0 + "（纯聊天）" })
+        effect.addSubview(modelPopup)
+        self.modelPopup = modelPopup
 
-        let popup = NSPopUpButton(frame: NSRect(x: 84, y: 102, width: 244, height: 28))
-        popup.addItems(withTitles: acpModels.map { $0 + "（dsh agent）" } + apiModels.map { $0 + "（纯聊天）" })
-        effect.addSubview(popup)
-        modelPopup = popup
+        label("朗读：", 226)
+        let ttsCheckbox = NSButton(checkboxWithTitle: "朗读回复", target: nil, action: nil)
+        ttsCheckbox.frame = NSRect(x: 100, y: 226, width: 84, height: 24)
+        effect.addSubview(ttsCheckbox)
+        self.ttsCheckbox = ttsCheckbox
+        let ttsRateSlider = NSSlider(frame: NSRect(x: 192, y: 226, width: 136, height: 24))
+        ttsRateSlider.minValue = 0.4
+        ttsRateSlider.maxValue = 0.65
+        ttsRateSlider.toolTip = "语速（慢 ← → 快）"
+        effect.addSubview(ttsRateSlider)
+        self.ttsRateSlider = ttsRateSlider
+
+        label("大小：", 186)
+        let sizePopup = NSPopUpButton(frame: NSRect(x: 100, y: 182, width: 228, height: 28))
+        sizePopup.addItems(withTitles: petSizeOptions.map(\.title))
+        effect.addSubview(sizePopup)
+        self.sizePopup = sizePopup
+
+        label("小动作：", 146)
+        let ambientPopup = NSPopUpButton(frame: NSRect(x: 100, y: 142, width: 228, height: 28))
+        ambientPopup.addItems(withTitles: ambientOptions.map(\.title))
+        ambientPopup.toolTip = "待机时随机小动作的频率"
+        effect.addSubview(ambientPopup)
+        self.ambientPopup = ambientPopup
+
+        let loginCheckbox = NSButton(checkboxWithTitle: "开机自动启动", target: nil, action: nil)
+        loginCheckbox.frame = NSRect(x: 100, y: 106, width: 160, height: 24)
+        effect.addSubview(loginCheckbox)
+        self.loginCheckbox = loginCheckbox
 
         let hint = NSTextField(labelWithString: "")
-        hint.frame = NSRect(x: 12, y: 66, width: 316, height: 28)
+        hint.frame = NSRect(x: 12, y: 58, width: 316, height: 40)
         hint.font = NSFont.systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byWordWrapping
@@ -555,14 +625,14 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         effect.addSubview(hint)
         settingsHint = hint
 
-        let close = NSButton(frame: NSRect(x: 158, y: 16, width: 82, height: 32))
+        let close = NSButton(frame: NSRect(x: 158, y: 14, width: 82, height: 32))
         close.title = "关闭"
         close.bezelStyle = .rounded
         close.target = self
         close.action = #selector(toggleSettingsAction)
         effect.addSubview(close)
 
-        let save = NSButton(frame: NSRect(x: 246, y: 16, width: 82, height: 32))
+        let save = NSButton(frame: NSRect(x: 246, y: 14, width: 82, height: 32))
         save.title = "保存"
         save.bezelStyle = .rounded
         save.target = self
@@ -581,11 +651,35 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         let index = max(0, min(modelPopup?.indexOfSelectedItem ?? 0, all.count - 1))
         let model = all[index]
         let conf = loadConf()
-        let changed = model != preferredModel || key != (conf["DEEPSEEK_API_KEY"] ?? "")
+        let agentChanged = model != preferredModel || key != (conf["DEEPSEEK_API_KEY"] ?? "")
+
         preferredModel = model
-        saveConf(apiKey: key, model: model)
+        speechEnabled = ttsCheckbox?.state == .on
+        synthesizerRate = ttsRateSlider?.floatValue ?? 0.52
+        let sizeIndex = max(0, min(sizePopup?.indexOfSelectedItem ?? 1, petSizeOptions.count - 1))
+        let newSize = petSizeOptions[sizeIndex].size
+        ambientIndex = max(0, min(ambientPopup?.indexOfSelectedItem ?? 2, ambientOptions.count - 1))
+        nextAmbient = Date().addingTimeInterval(ambientOptions[ambientIndex].range?.lowerBound ?? .infinity)
+
+        saveConf([
+            "DEEPSEEK_API_KEY": key,
+            "WHALEPET_MODEL": model,
+            "WHALEPET_TTS": speechEnabled ? "1" : "0",
+            "WHALEPET_TTS_RATE": String(format: "%.2f", synthesizerRate),
+            "WHALEPET_SIZE": String(Int(newSize)),
+            "WHALEPET_AMBIENT": String(ambientIndex),
+        ])
+
+        if newSize != currentPetSize {
+            currentPetSize = newSize
+            window.setContentSize(NSSize(width: newSize, height: newSize))
+            view.frame = NSRect(origin: .zero, size: NSSize(width: newSize, height: newSize))
+        }
+
+        setLoginItem(loginCheckbox?.state == .on)
+
         settingsHint?.stringValue = "已保存 ✓"
-        if changed {
+        if agentChanged {
             // key/model 都是 ACP 子进程启动时注入的，必须重启才能生效。
             acp?.terminate()
             acp = nil
@@ -595,6 +689,47 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             acpPersonaSent = false
             if wantsAcp { startAcpIfNeeded() }
         }
+    }
+
+    // MARK: - Login item (LaunchAgent)
+
+    private func setLoginItem(_ enabled: Bool) {
+        let fm = FileManager.default
+        let exists = fm.fileExists(atPath: launchAgentPath)
+        guard enabled != exists else { return }
+        if enabled {
+            guard let executable = Bundle.main.executablePath else { return }
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+            	<key>Label</key>
+            	<string>local.whalepet</string>
+            	<key>ProgramArguments</key>
+            	<array>
+            		<string>\(executable)</string>
+            	</array>
+            	<key>RunAtLoad</key>
+            	<true/>
+            </dict>
+            </plist>
+            """
+            try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+            runQuiet("/bin/launchctl", ["bootstrap", "gui/\(getuid())", launchAgentPath])
+        } else {
+            runQuiet("/bin/launchctl", ["bootout", "gui/\(getuid())/local.whalepet"])
+            try? fm.removeItem(atPath: launchAgentPath)
+        }
+    }
+
+    private func runQuiet(_ launch: String, _ arguments: [String]) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launch)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
     }
 
     // MARK: - Full web UI
@@ -681,8 +816,12 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
             }
         }
         if action == "idle", Date() > nextAmbient {
-            nextAmbient = Date().addingTimeInterval(.random(in: 25...60))
-            play(ambientActions.randomElement()!)
+            if let range = ambientOptions[ambientIndex].range {
+                nextAmbient = Date().addingTimeInterval(.random(in: range))
+                play(ambientActions.randomElement()!)
+            } else {
+                nextAmbient = Date.distantFuture
+            }
         }
     }
 
@@ -930,7 +1069,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate 
         let clipped = text.count > 200 ? String(text.prefix(200)) + "……后面太长，人家就不念啦" : text
         let utterance = AVSpeechUtterance(string: clipped)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-        utterance.rate = 0.52
+        utterance.rate = synthesizerRate
         synthesizer.speak(utterance)
     }
 
