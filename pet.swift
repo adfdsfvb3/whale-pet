@@ -24,7 +24,30 @@ let acpPersonaPrefix = "（对话设定：你是住在用户 Mac 桌面上的女
 
 let dshRepo = "/Users/miao/deepseek-harness"
 let defaultDshRepo = dshRepo
-let nodeBin = "/Users/miao/.nvm/versions/node/v24.16.0/bin"
+
+/// Locate the directory containing `node`/`pnpm`: ask a login shell first
+/// (covers nvm, homebrew, fnm, volta, mise), then fall back to common
+/// fixed locations. Returns nil when Node.js is not installed.
+func findNodeBin() -> String? {
+    let probe = Process()
+    probe.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    probe.arguments = ["-lc", "command -v node"]
+    let pipe = Pipe()
+    probe.standardOutput = pipe
+    probe.standardError = FileHandle.nullDevice
+    if let _ = try? probe.run() {
+        probe.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let path = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            return (path as NSString).deletingLastPathComponent
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        if FileManager.default.fileExists(atPath: dir + "/node") { return dir }
+    }
+    return nil
+}
 
 struct ChatMessage: Codable {
     let role: String
@@ -506,6 +529,9 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     private var workspace: String {
         NSHomeDirectory() + "/whale-pet/workspace"
     }
+
+    /// Node.js 安装目录，首次使用时探测（login shell + 常见路径）。
+    private lazy var nodeBin: String? = findNodeBin()
 
     /// WHALEPET_SELFTEST=1 runs a headless ACP smoke test at launch: boots the
     /// agent, sends one prompt, logs the outcome to /tmp/whalepet-selftest.log
@@ -1170,6 +1196,10 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             pluginLog("已有安装任务在进行，等它结束再装")
             return
         }
+        guard let nodeBin else {
+            pluginLog("✗ 未找到 Node.js，请先安装（https://nodejs.org）")
+            return
+        }
         installRunning = true
         pluginLog("→ pnpm dsh plugin --profile web add \(pkg)")
         let process = Process()
@@ -1251,6 +1281,11 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
 
     private func bootWeb(_ url: URL, attempts: Int, openWhenUp: Bool) {
         if attempts == 0 {
+            guard let nodeBin else {
+                statusLabel.stringValue = "未找到 Node.js，无法启动 dsh web"
+                pluginLog("✗ 未找到 Node.js，无法启动 dsh web")
+                return
+            }
             statusLabel.stringValue = "正在启动 dsh web……"
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -1485,6 +1520,12 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             }
         }
 
+        guard let nodeBin else {
+            statusLabel.stringValue = "未找到 Node.js（https://nodejs.org），回退到普通聊天"
+            acpStarting = false
+            acpFailed = true
+            return
+        }
         var env = ProcessInfo.processInfo.environment
         env["DEEPSEEK_API_KEY"] = key
         env["DSH_ACP_MODEL"] = preferredModel
