@@ -352,6 +352,7 @@ final class AcpClient {
 
 final class PetView: NSImageView {
     var onDragStateChange: ((Bool) -> Void)?
+    var onWindowMove: (() -> Void)?
     var onClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
     var onToggleChat: (() -> Void)?
@@ -371,6 +372,7 @@ final class PetView: NSImageView {
         onDragStateChange?(true)
         let mouse = NSEvent.mouseLocation
         window?.setFrameOrigin(NSPoint(x: mouse.x - downPoint.x, y: mouse.y - downPoint.y))
+        onWindowMove?()
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -590,6 +592,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             }
         }
         view.onClick = { [weak self] in self?.toggleBubble() }
+        view.onWindowMove = { [weak self] in self?.followPanels() }
         view.onDoubleClick = { [weak self] in self?.play(clickActions.randomElement()!) }
         view.onToggleChat = { [weak self] in self?.toggleBubble() }
         view.onOpenSettings = { [weak self] in self?.toggleSettings() }
@@ -794,6 +797,19 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         bubble.setFrameOrigin(origin)
     }
 
+    /// 拖动/游走时让所有打开的面板跟着宠物走（borderless panel 的子窗口
+    /// 自动跟随不可靠，改为显式重定位）。
+    private func followPanels() {
+        if bubble.isVisible { positionBubble() }
+        if let panel = settingsPanel, panel.isVisible { positionAbovePet(panel) }
+        if let panel = pluginsPanel, panel.isVisible { positionAbovePet(panel) }
+    }
+
+    private func positionAbovePet(_ panel: NSPanel) {
+        let pet = window.frame
+        panel.setFrameOrigin(NSPoint(x: pet.midX - panel.frame.width / 2, y: pet.maxY + 10))
+    }
+
     @objc private func closeBubbleAction() { toggleBubble() }
 
     // MARK: - 历史对话面板
@@ -987,8 +1003,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         walkCheckbox?.state = walkEnabled ? .on : .off
         loginCheckbox?.state = FileManager.default.fileExists(atPath: launchAgentPath) ? .on : .off
         settingsHint?.stringValue = "保存后立即生效；切换模型或 key 会重启 dsh agent"
-        let pet = window.frame
-        panel.setFrameOrigin(NSPoint(x: pet.midX - panel.frame.width / 2, y: pet.maxY + 10))
+        positionAbovePet(panel)
         panel.orderFrontRegardless()
     }
 
@@ -1215,8 +1230,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             return
         }
         refreshPluginStates()
-        let pet = window.frame
-        panel.setFrameOrigin(NSPoint(x: pet.midX - panel.frame.width / 2, y: pet.maxY + 10))
+        positionAbovePet(panel)
         panel.orderFrontRegardless()
     }
 
@@ -1565,6 +1579,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         }
         window.setFrameOrigin(NSPoint(x: window.frame.origin.x + walkStep.x,
                                       y: window.frame.origin.y + walkStep.y))
+        followPanels()
         walkStepsLeft -= 1
         if walkStepsLeft == 0 { endWalk(save: true) }
     }
