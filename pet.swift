@@ -1065,7 +1065,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         }
 
         label("API Key：", 346)
-        let keyField = NSSecureTextField(frame: NSRect(x: 100, y: 344, width: 228, height: 26))
+        let keyField = NSSecureTextField(frame: NSRect(x: 100, y: 344, width: 200, height: 26))
         keyField.placeholderString = "sk-..."
         effect.addSubview(keyField)
         self.keyField = keyField
@@ -1292,7 +1292,7 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         title.font = NSFont.boldSystemFont(ofSize: 13)
         effect.addSubview(title)
 
-        let closePlugins = NSButton(frame: NSRect(x: 380 - 44, y: 380 - 34, width: 24, height: 24))
+        let closePlugins = NSButton(frame: NSRect(x: size.width - 32, y: size.height - 32, width: 24, height: 24))
         closePlugins.title = "✕"
         closePlugins.bezelStyle = .rounded
         closePlugins.font = NSFont.systemFont(ofSize: 11)
