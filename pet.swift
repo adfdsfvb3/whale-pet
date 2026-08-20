@@ -1049,6 +1049,15 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         effect.layer?.masksToBounds = true
         panel.contentView = effect
 
+        let closeSettings = NSButton(frame: NSRect(x: size.width - 32, y: size.height - 32, width: 24, height: 24))
+        closeSettings.title = "✕"
+        closeSettings.bezelStyle = .rounded
+        closeSettings.font = NSFont.systemFont(ofSize: 11)
+        closeSettings.target = self
+        closeSettings.action = #selector(toggleSettingsAction)
+        closeSettings.toolTip = "关闭"
+        effect.addSubview(closeSettings)
+
         func label(_ text: String, _ y: CGFloat) {
             let l = NSTextField(labelWithString: text)
             l.frame = NSRect(x: 12, y: y + 2, width: 88, height: 20)
@@ -1144,6 +1153,8 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
     }
 
     @objc private func toggleSettingsAction() { toggleSettings() }
+
+    @objc private func closePluginsAction() { togglePlugins() }
 
     @objc private func saveSettings() {
         let key = (keyField?.stringValue ?? "").trimmingCharacters(in: .whitespaces)
@@ -1280,6 +1291,15 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         title.frame = NSRect(x: 12, y: 348, width: 240, height: 20)
         title.font = NSFont.boldSystemFont(ofSize: 13)
         effect.addSubview(title)
+
+        let closePlugins = NSButton(frame: NSRect(x: 380 - 44, y: 380 - 34, width: 24, height: 24))
+        closePlugins.title = "✕"
+        closePlugins.bezelStyle = .rounded
+        closePlugins.font = NSFont.systemFont(ofSize: 11)
+        closePlugins.target = self
+        closePlugins.action = #selector(closePluginsAction)
+        closePlugins.toolTip = "关闭"
+        effect.addSubview(closePlugins)
 
         let rowHeight: CGFloat = 26
         let docView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: rowHeight * CGFloat(knownPlugins.count)))
