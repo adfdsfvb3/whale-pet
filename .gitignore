@@ -4,6 +4,11 @@ dist/
 .DS_Store
 *.conf
 
+# 运行时数据（对话历史/记忆/agent 沙箱工作区），含私人内容，不入库
+history/
+memory.md
+workspace/
+
 # Electron 桌宠：帧序列由构建脚本生成，依赖与打包产物不入库
 !electron/build/
 electron/frames/

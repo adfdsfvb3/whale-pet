@@ -25,6 +25,20 @@ let acpPersonaPrefix = "（对话设定：你是住在用户 Mac 桌面上的女
 let dshRepo = "/Users/miao/deepseek-harness"
 let defaultDshRepo = dshRepo
 
+/// Zero-install runtime bundled inside WhalePet.app (Contents/Resources/runtime):
+/// a standalone `node` binary plus a self-contained dsh tree (`dsh/`) assembled
+/// by bundle.sh. When present it takes precedence over the source repo, so the
+/// app works on machines without Node/npm/the dsh checkout.
+let bundledRuntime: (node: String, dshRoot: String)? = {
+    guard let res = Bundle.main.resourcePath else { return nil }
+    let root = res + "/runtime"
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: root + "/node"),
+          fm.fileExists(atPath: root + "/dsh/node_modules/@deepseek-ai/dsh-acp-demo/lib/bin.js"),
+          fm.fileExists(atPath: root + "/dsh/acp-agent/cordis.yml") else { return nil }
+    return (root + "/node", root + "/dsh")
+}()
+
 /// Locate the directory containing `node`/`pnpm`. Fast paths first (fixed
 /// Homebrew locations + newest nvm version dir, all instant); a login-shell
 /// probe with a hard timeout is only the last resort, so a slow/flaky .zshrc
@@ -1702,8 +1716,9 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             acpFailed = true
             return
         }
-        guard FileManager.default.fileExists(atPath: repoPath + "/packages/examples/acp-demo/src/bin.ts") else {
-            statusLabel.stringValue = "找不到 dsh 仓库（\(repoPath)），回退到普通聊天"
+        if bundledRuntime == nil,
+           !FileManager.default.fileExists(atPath: repoPath + "/packages/examples/acp-demo/src/bin.ts") {
+            statusLabel.stringValue = "找不到 dsh（内置运行时缺失，仓库 \(repoPath) 也不存在），回退到普通聊天"
             acpFailed = true
             return
         }
@@ -1740,24 +1755,42 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
             }
         }
 
-        guard let nodeBin else {
-            statusLabel.stringValue = "未找到 Node.js（https://nodejs.org），回退到普通聊天"
-            acpStarting = false
-            acpFailed = true
-            return
+        // Launch resolution: bundled runtime first, source repo as fallback.
+        let nodePath: String
+        let launchArgs: [String]
+        let launchCwd: String
+        if let bundled = bundledRuntime {
+            nodePath = bundled.node
+            launchCwd = bundled.dshRoot
+            launchArgs = ["node_modules/@deepseek-ai/dsh-acp-demo/lib/bin.js",
+                          "--config", "acp-agent/cordis.yml"]
+        } else {
+            guard let nodeBin else {
+                statusLabel.stringValue = "未找到 Node.js（https://nodejs.org），回退到普通聊天"
+                acpStarting = false
+                acpFailed = true
+                return
+            }
+            nodePath = nodeBin + "/node"
+            launchCwd = repoPath
+            launchArgs = ["--import", "tsx",
+                          "packages/examples/acp-demo/src/bin.ts",
+                          "--config", "examples/acp-agent/cordis.yml"]
         }
         var env = ProcessInfo.processInfo.environment
         env["DEEPSEEK_API_KEY"] = key
         env["DSH_ACP_MODEL"] = preferredModel
-        env["PATH"] = nodeBin + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        env["PATH"] = (nodePath as NSString).deletingLastPathComponent + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         env["HOME"] = NSHomeDirectory()
+        if bundledRuntime != nil {
+            // Keep ACP session logs out of the (conceptually read-only) app bundle.
+            env["DSH_SNAPSHOT_SESSIONS_ROOT"] = NSHomeDirectory() + "/whale-pet/.sessions"
+        }
 
         do {
-            try client.start(executable: nodeBin + "/node",
-                             arguments: ["--import", "tsx",
-                                         "packages/examples/acp-demo/src/bin.ts",
-                                         "--config", "examples/acp-agent/cordis.yml"],
-                             cwd: repoPath, env: env)
+            try client.start(executable: nodePath,
+                             arguments: launchArgs,
+                             cwd: launchCwd, env: env)
         } catch {
             statusLabel.stringValue = "dsh 启动失败，回退到普通聊天"
             acpStarting = false

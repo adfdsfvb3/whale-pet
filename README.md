@@ -11,7 +11,7 @@
 - **macOS**：`WhalePet-macOS.zip` → 解压双击（未签名，首次 右键 → 打开）
 - **Windows**：`WhalePet-Setup-1.0.0.exe` → NSIS 一键安装（未签名，SmartScreen 点"仍要运行"）
 
-安装后：右键宠物 → 设置，粘贴自己的 DeepSeek API key 即可聊天；agent 模式还需要本机装有 Node.js 和 deepseek-harness 仓库（设置里改路径），没有也能用纯聊天模式。
+安装后：右键宠物 → 设置，粘贴自己的 DeepSeek API key 即可使用。**macOS 发布包已内置 Node.js 和 dsh agent 运行时，开箱即用，不需要安装任何开发环境**；Windows 版的 agent 模式仍需本机 checkout dsh 源码仓库（没有则自动用纯聊天模式）。
 
 ## 功能
 
@@ -35,9 +35,9 @@
 
 ### dsh agent 模式说明
 
-- 需要本机已 clone 并构建 deepseek-harness（路径在 `pet.swift` 的 `dshRepo` 常量，默认 `/Users/miao/deepseek-harness`，按需修改）
-- 首次打开对话框时自动拉起 ACP server 子进程（`node --import tsx packages/examples/acp-demo/src/bin.ts`），通过 stdin/stdout 上的 ndjson JSON-RPC 通信
-- 模型通过 `DSH_ACP_MODEL` 环境变量注入（需要在 dsh 仓库的 `examples/acp-agent/cordis.yml` 把 `model` 一行改为 `!!js "process.env.DSH_ACP_MODEL ?? 'deepseek-v4-pro'"`，本仓库假设已打此补丁）
+- **内置运行时（默认）**：发布包的 `Contents/Resources/runtime/` 里带了一个独立 node 二进制和 `pnpm deploy` 出的自包含 dsh 依赖树（约 90MB，只含 ACP 闭包），首次打开对话框时自动拉起 ACP server 子进程，通过 stdin/stdout 上的 ndjson JSON-RPC 通信
+- **源码仓库（开发者后备）**：没有内置运行时时，回退到设置面板里配置的 deepseek-harness 源码仓库（`node --import tsx packages/examples/acp-demo/src/bin.ts` 方式启动）
+- 模型通过 `DSH_ACP_MODEL` 环境变量注入（内置运行时的 cordis.yml 已带 `!!js "process.env.DSH_ACP_MODEL ?? 'deepseek-v4-pro'"` 补丁和 skill 插件组合）
 - **安全边界**：agent 的文件系统和命令执行被沙箱限制在 `~/whale-pet/workspace`；一次性权限请求自动允许（仅在该沙箱范围内）
 - 想让她操作别的目录，直接对话里说明即可——她会先复制/移动到 workspace 内处理
 - `WHALEPET_SELFTEST=1 open dist/WhalePet.app` 可无界面自测 ACP 链路（结果写 `/tmp/whalepet-selftest.log`）
@@ -49,9 +49,12 @@
 依赖：macOS、Xcode Command Line Tools（`swiftc`）、python3、npm。
 
 ```sh
-./build.sh       # 构建 dist/WhalePet.app
+./build.sh       # 构建 dist/WhalePet.app（纯聊天版，agent 需本机 dsh 源码仓库）
 ./release.sh     # 额外打出 dist/WhalePet-macOS.zip 发布包
+./bundle.sh      # 小白版：在 build.sh 基础上内嵌 node + dsh 运行时后再打 zip
 ```
+
+`bundle.sh` 额外需要一份构建过的 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 源码（`pnpm install && pnpm run build`，路径用 `DSH_REPO` 指定，默认 `~/deepseek-harness`）。它通过 `pnpm deploy` 把 ACP 闭包（`bundle/acp-mini.package.json` 声明的 94 个 workspace 包）导出成自包含依赖树，连同 node 二进制一起塞进 `Contents/Resources/runtime/`。
 
 构建脚本会自动完成：npm 下载 dsh-pet 素材 → 创建 Python 虚拟环境（av/pillow/numpy）→ 从 webm 提取透明 PNG 帧（240px / 12fps）→ 生成应用图标 → `swiftc` 编译 → 打包。
 
@@ -98,6 +101,8 @@ extract_frames.py  帧提取脚本：webm → 抠黑底透明 PNG 序列
 test-acp.py        ACP 链路独立冒烟测试（python3 test-acp.py）
 build.sh           macOS 一键构建脚本
 release.sh         macOS 发布打包脚本（构建 + zip）
+bundle.sh          小白版打包脚本（内嵌 node + dsh 运行时）
+bundle/            打包物料（acp-mini umbrella 的 package.json）
 Info.plist         app 包配置（含权限说明文案）
 ```
 
