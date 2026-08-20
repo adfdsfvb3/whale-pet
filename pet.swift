@@ -25,28 +25,45 @@ let acpPersonaPrefix = "（对话设定：你是住在用户 Mac 桌面上的女
 let dshRepo = "/Users/miao/deepseek-harness"
 let defaultDshRepo = dshRepo
 
-/// Locate the directory containing `node`/`pnpm`: ask a login shell first
-/// (covers nvm, homebrew, fnm, volta, mise), then fall back to common
-/// fixed locations. Returns nil when Node.js is not installed.
+/// Locate the directory containing `node`/`pnpm`. Fast paths first (fixed
+/// Homebrew locations + newest nvm version dir, all instant); a login-shell
+/// probe with a hard timeout is only the last resort, so a slow/flaky .zshrc
+/// can never block or poison discovery.
 func findNodeBin() -> String? {
+    let fm = FileManager.default
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] where fm.fileExists(atPath: dir + "/node") {
+        return dir
+    }
+    // nvm：取版本号最大的可用目录（按数字段比较，避免 v9 > v24 的字符串误判）。
+    let nvmRoot = NSHomeDirectory() + "/.nvm/versions/node"
+    if let versions = try? fm.contentsOfDirectory(atPath: nvmRoot) {
+        func semver(_ name: String) -> [Int] {
+            name.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+                .split(separator: ".").map { Int($0) ?? 0 }
+        }
+        let best = versions
+            .filter { fm.fileExists(atPath: nvmRoot + "/" + $0 + "/bin/node") }
+            .max { semver($0).lexicographicallyPrecedes(semver($1)) }
+        if let best { return nvmRoot + "/" + best + "/bin" }
+    }
+    // 兜底：login shell 探测（fnm/volta/mise 等），硬超时 6 秒防 .zshrc 卡死。
     let probe = Process()
     probe.executableURL = URL(fileURLWithPath: "/bin/zsh")
     probe.arguments = ["-lc", "command -v node"]
     let pipe = Pipe()
     probe.standardOutput = pipe
     probe.standardError = FileHandle.nullDevice
-    if let _ = try? probe.run() {
-        probe.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        if let path = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
-            return (path as NSString).deletingLastPathComponent
-        }
+    guard let _ = try? probe.run() else { return nil }
+    let deadline = Date().addingTimeInterval(6)
+    while probe.isRunning, Date() < deadline { usleep(50_000) }
+    if probe.isRunning {
+        probe.terminate()
+        return nil
     }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        if FileManager.default.fileExists(atPath: dir + "/node") { return dir }
-    }
-    return nil
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let path = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else { return nil }
+    return (path as NSString).deletingLastPathComponent
 }
 
 struct ChatMessage: Codable {
@@ -542,8 +559,15 @@ final class PetController: NSObject, NSApplicationDelegate, NSTextFieldDelegate,
         NSHomeDirectory() + "/whale-pet/workspace"
     }
 
-    /// Node.js 安装目录，首次使用时探测（login shell + 常见路径）。
-    private lazy var nodeBin: String? = findNodeBin()
+    /// Node.js 安装目录。只缓存成功结果：探测失败（nil）时下次使用会重试，
+    /// 避免开机自启时一次失败整轮降级。
+    private var nodeBinCache: String?
+    private var nodeBin: String? {
+        if let nodeBinCache { return nodeBinCache }
+        let found = findNodeBin()
+        nodeBinCache = found
+        return found
+    }
 
     /// WHALEPET_SELFTEST=1 runs a headless ACP smoke test at launch: boots the
     /// agent, sends one prompt, logs the outcome to /tmp/whalepet-selftest.log
